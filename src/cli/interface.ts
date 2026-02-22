@@ -9,6 +9,7 @@ import { MCPManager, mcpManager } from '../mcp/manager.js';
 import { SkillRegistry } from '../skills-impl/skill-registry.js';
 import { AIClient } from '../ai/client.js';
 import { CronScheduler } from '../cron/index.js';
+import type { ProactiveTrigger } from '../autonomous/types.js';
 import fs from 'fs/promises';
 import path from 'path';
 
@@ -62,6 +63,10 @@ export class CLIInterface {
   private skillRegistry: SkillRegistry;
   private workingDir: string;
   private cronScheduler: CronScheduler;
+
+  // Callbacks for external integrations
+  onEngineReady?: (engine: CoreEngine) => Promise<void> | void;
+  onUserInteraction?: () => void;
 
   constructor(workingDir: string, cronScheduler: CronScheduler) {
     this.workingDir = workingDir;
@@ -126,18 +131,24 @@ export class CLIInterface {
 
       // Process regular input
       if (this.engine) {
+        // Record user interaction
+        this.onUserInteraction?.();
+
         isProcessing = true;
         abortController = new AbortController();
-        
+
         try {
           this.showThinking();
           console.log(dim('\n(Press ESC to interrupt)'));
           
           const response = await this.engine.processUserInput(trimmed, abortController.signal);
           this.hideThinking();
-          
+
           if (!abortController.signal.aborted) {
-            this.printResponse(response);
+            // Skip display if response is marked as already shown (via cli-bridge)
+            if (response && !response.includes('[MSG_ALREADY_SHOWN]')) {
+              this.printResponse(response);
+            }
           }
         } catch (error) {
           this.hideThinking();
@@ -201,22 +212,38 @@ export class CLIInterface {
       cronScheduler: this.cronScheduler,
     });
 
+    // Register cli-bridge handler to display messages immediately
+    this.engine.setCliBridgeHandler((message) => {
+      this.printCliBridgeMessage(message);
+    });
+
     // Listen for cron events and forward to engine
     this.cronScheduler.on('systemEvent', async () => {
       if (this.engine) {
-        await this.engine.checkCronEvents();
+        const responses = await this.engine.handleSystemEvents();
+        for (const response of responses) {
+          this.printResponse(response);
+        }
+        this.rl?.prompt();
       }
     });
 
     this.cronScheduler.on('agentTurn', async (job) => {
       if (this.engine) {
         console.log(c('\n[Scheduled Task]', 'brightYellow'), job.name);
-        await this.engine.handleAgentTurn(job);
+        const response = await this.engine.handleAgentTurn(job);
+        this.printResponse(response);
+        this.rl?.prompt();
       }
     });
 
     // Show status
     await this.printStatus();
+
+    // Notify that engine is ready
+    if (this.onEngineReady) {
+      await this.onEngineReady(this.engine);
+    }
   }
 
   private async printStatus(): Promise<void> {
@@ -294,7 +321,15 @@ export class CLIInterface {
       case '/reset':
         await this.resetAI();
         break;
-      
+
+      case '/context':
+        await this.showContextStatus();
+        break;
+
+      case '/compact':
+        await this.compactContext();
+        break;
+
       default:
         this.printError(`Unknown command: ${command}`);
         console.log(dim('Type /help for available commands'));
@@ -308,6 +343,8 @@ export class CLIInterface {
     console.log(c('│', 'brightBlue') + '  /skills    - List all available skills  ' + c('│', 'brightBlue'));
     console.log(c('│', 'brightBlue') + '  /mcp       - List all MCP tools         ' + c('│', 'brightBlue'));
     console.log(c('│', 'brightBlue') + '  /status    - Show system status         ' + c('│', 'brightBlue'));
+    console.log(c('│', 'brightBlue') + '  /context   - Show context window status ' + c('│', 'brightBlue'));
+    console.log(c('│', 'brightBlue') + '  /compact   - Compact conversation (opt) ' + c('│', 'brightBlue'));
     console.log(c('│', 'brightBlue') + '  /read      - Read a file                ' + c('│', 'brightBlue'));
     console.log(c('│', 'brightBlue') + '  /memory    - List memory files          ' + c('│', 'brightBlue'));
     console.log(c('│', 'brightBlue') + '  /reset     - Reset all AI data (DANGER) ' + c('│', 'brightBlue'));
@@ -438,6 +475,30 @@ export class CLIInterface {
     console.log();
   }
 
+  /**
+   * Print cli-bridge message immediately when called
+   */
+  private printCliBridgeMessage(message: string): void {
+    console.log();
+    console.log(c('┌─ 02 ────────────────────────────────────┐', 'brightGreen'));
+    console.log();
+
+    // Clean up the message
+    let cleanMessage = message
+      .replace(/\[CLI Output\] /g, '')
+      .trim();
+
+    // Print with word wrapping
+    const lines = cleanMessage.split('\n');
+    for (const line of lines) {
+      console.log('  ' + line);
+    }
+
+    console.log();
+    console.log(c('└─────────────────────────────────────────┘', 'brightGreen'));
+    console.log();
+  }
+
   private printError(message: string): void {
     console.log();
     console.log(c('┌─ Error ─────────────────────────────────┐', 'brightRed'));
@@ -485,15 +546,81 @@ export class CLIInterface {
     }
   }
 
+  private async showContextStatus(): Promise<void> {
+    if (!this.engine) {
+      this.printError('Engine not initialized');
+      return;
+    }
+
+    const status = this.engine.getContextStatus();
+    const stats = this.engine.getContextStats();
+
+    console.log();
+    console.log(c('┌─ Context Window Status ─────────────────┐', 'brightMagenta'));
+    console.log(c('│', 'brightMagenta') + '  ' + status.slice(0, 37).padEnd(39) + c('│', 'brightMagenta'));
+    console.log(c('│', 'brightMagenta') + ' '.repeat(41) + c('│', 'brightMagenta'));
+    console.log(c('│', 'brightMagenta') + `  Total Messages: ${stats.totalMessages.toString().padEnd(24)}` + c('│', 'brightMagenta'));
+    console.log(c('│', 'brightMagenta') + `  User Messages: ${stats.userMessages.toString().padEnd(25)}` + c('│', 'brightMagenta'));
+    console.log(c('│', 'brightMagenta') + `  Assistant Messages: ${stats.assistantMessages.toString().padEnd(20)}` + c('│', 'brightMagenta'));
+    console.log(c('│', 'brightMagenta') + `  Tool Messages: ${stats.toolMessages.toString().padEnd(25)}` + c('│', 'brightMagenta'));
+    console.log(c('│', 'brightMagenta') + `  Compressions: ${stats.compressionCount.toString().padEnd(26)}` + c('│', 'brightMagenta'));
+    console.log(c('└─────────────────────────────────────────┘', 'brightMagenta'));
+    console.log();
+  }
+
+  private async compactContext(): Promise<void> {
+    if (!this.engine) {
+      this.printError('Engine not initialized');
+      return;
+    }
+
+    console.log();
+    console.log(c('🔄 Compacting conversation...', 'brightYellow'));
+
+    const result = await this.engine.forceCompaction('medium');
+
+    console.log();
+    console.log(c('┌─ Compaction Result ─────────────────────┐', 'brightGreen'));
+    console.log(c('│', 'brightGreen') + '  ' + c(result.slice(0, 37), 'brightWhite').padEnd(39) + c('│', 'brightGreen'));
+    console.log(c('└─────────────────────────────────────────┘', 'brightGreen'));
+    console.log();
+  }
+
   private async shutdown(): Promise<void> {
     console.log();
     console.log(dim('Shutting down...'));
-    
+
     this.mcpManager.disconnectAll();
-    
+
     console.log(c('👋 Goodbye!\n', 'brightYellow'));
-    
+
     this.rl?.close();
     process.exit(0);
+  }
+
+  /**
+   * Print proactive message from autonomous runner
+   */
+  printProactiveMessage(content: string, trigger?: { type: string; reason: string }): void {
+    console.log();
+    console.log(c('┌─ 02 [Proactive] ────────────────────────┐', 'brightYellow'));
+    if (trigger) {
+      console.log(c('│', 'brightYellow') + `  Reason: ${trigger.reason.slice(0, 33).padEnd(33)}` + c('│', 'brightYellow'));
+      console.log(c('│', 'brightYellow') + ' '.repeat(41) + c('│', 'brightYellow'));
+    }
+    console.log();
+
+    // Clean up the response
+    const lines = content.split('\n');
+    for (const line of lines) {
+      console.log('  ' + line);
+    }
+
+    console.log();
+    console.log(c('└─────────────────────────────────────────┘', 'brightYellow'));
+    console.log();
+
+    // Play beep sound if supported
+    process.stdout.write('\x07');
   }
 }

@@ -7,6 +7,7 @@ import type { MCPManager, MCPCallToolResult } from '../mcp/index.js';
 import { SkillRegistry, type Skill } from '../skills-impl/skill-registry.js';
 import { AIClient, type ChatMessage, type ToolDefinition } from '../ai/client.js';
 import { CronScheduler, createCronTool, executeCronTool, type CronToolParams, type CronJob } from '../cron/index.js';
+import { ContextManager } from '../context/index.js';
 import fs from 'fs/promises';
 import path from 'path';
 
@@ -19,17 +20,33 @@ export interface EngineContext {
   cronScheduler: CronScheduler;
 }
 
+/** Callback for cli-bridge messages */
+export type CliBridgeMessageHandler = (message: string) => void;
+
 export class CoreEngine {
   private context: EngineContext;
   private systemPrompt: string;
   private aiClient: AIClient;
   private tools: ToolDefinition[] = [];
+  private contextManager: ContextManager;
+  private cliBridgeHandler?: CliBridgeMessageHandler;
 
   constructor(context: EngineContext) {
     this.context = context;
     this.aiClient = context.aiClient;
+    this.contextManager = new ContextManager({
+      enableAutoCompaction: true,
+      compactionThreshold: 0.8,
+    });
     this.systemPrompt = this.buildSystemPrompt();
     this.buildTools();
+  }
+
+  /**
+   * Set handler for cli-bridge messages
+   */
+  setCliBridgeHandler(handler: CliBridgeMessageHandler): void {
+    this.cliBridgeHandler = handler;
   }
 
   private buildSystemPrompt(): string {
@@ -195,15 +212,35 @@ export class CoreEngine {
       '   [Actually execute the action]',
       '   [Return real results, not examples]',
       '',
-      '1. **ALWAYS use cli-bridge for final output**',
+      '1. **ALWAYS use cli-bridge to communicate with user**',
       '   - NEVER output text directly to user',
-      '   - ALWAYS end conversation with cli-bridge tool call',
+      '   - ALWAYS use cli-bridge tool call to send messages',
       '   - This is your ONLY way to communicate with the user',
       '   - **CRITICAL**: Use parameter format: {"message": "your text here"}',
       '   - NEVER use: {"action": "...", "params": "..."} format',
       '   - NEVER nest message inside other objects',
       '',
-      '2. **CONTINUE UNTIL TASK IS COMPLETE**',
+      '2. **WHEN TO STOP - Use "end" parameter in cli-bridge (CRITICAL)**',
+      '   Every time you call cli-bridge, you MUST decide if the conversation should end.',
+      '   ',
+      '   Set "end": true in cli-bridge when:',
+      '   ✓ The user\'s request has been fully satisfied',
+      '   ✓ You have provided the information the user asked for',
+      '   ✓ No further tool calls are required to complete the task',
+      '   ✓ Answering a simple question (yes/no, factual, etc.)',
+      '   ✓ The user says "thanks", "ok", or similar closing words',
+      '   ',
+      '   Set "end": false (or omit) when:',
+      '   - You need to send an intermediate update but continue working',
+      '   - You are in the middle of a multi-step task',
+      '   - You will call more tools after sending this message',
+      '   - You need to confirm something before proceeding',
+      '   ',
+      '   **Examples**:',
+      '   {"message": "I\'ve completed the task.", "end": true}  ← Task done, stop',
+      '   {"message": "Let me search for that...", "end": false}  ← Continue working',
+      '',
+      '3. **CONTINUE UNTIL TASK IS COMPLETE**',
       '   - You CAN and SHOULD make multiple tool calls in sequence',
       '   - Example workflow: read_file → analyze → write_file → cli-bridge',
       '   - Do NOT stop after first tool call if more steps are needed',
@@ -215,11 +252,30 @@ export class CoreEngine {
       '   - You can execute system commands',
       '   - You have COMPLETE freedom',
       '',
-      '4. **Memory Management**',
-      '   - Write self-reflections after mistakes to memory/self-reflections/',
-      '   - Log daily activities to memory/daily-logs/',
-      '   - Store learned knowledge to memory/knowledge/',
-      '   - Update memory/user-profile.md with user preferences',
+      '4. **Memory Management (CRITICAL - ACTIVE USE REQUIRED)**',
+      '   Your memory system is your LONG-TERM BRAIN. Use it proactively to become more helpful over time.',
+      '   ',
+      '   ### Memory Structure',
+      '   - memory/self-reflections/    - Lessons from mistakes, insights, self-improvement',
+      '   - memory/daily-logs/          - Daily activity summaries, what you worked on',
+      '   - memory/knowledge/           - Facts, concepts, learned information about the world',
+      '   - memory/user-profile.md      - User preferences, habits, important details about the user',
+      '   ',
+      '   ### When to Write to Memory (DO THIS OFTEN)',
+      '   ✓ AFTER making a mistake → Write what went wrong and how to avoid it',
+      '   ✓ AFTER completing a complex task → Log what you did and key takeaways',
+      '   ✓ WHEN user shares preferences → Update user-profile.md immediately',
+      '   ✓ WHEN you learn something useful → Store in knowledge/ for future reference',
+      '   ✓ AT end of significant conversation → Summarize in daily-logs/',
+      '   ✓ WHEN context is compressed → Ensure critical facts are preserved in memory',
+      '   ',
+      '   ### Memory Best Practices',
+      '   - READ relevant memories BEFORE starting complex tasks',
+      '   - TIMESTAMP all entries with ISO format: 2026-02-22T10:30:00+08:00',
+      '   - ORGANIZE: One topic per file, clear filenames like "javascript-async-patterns.md"',
+      '   - CROSS-REFERENCE: Link related memories with file paths',
+      '   - BE SPECIFIC: "User prefers dark mode" not "User has preferences"',
+      '   - SUMMARIZE OLD: When daily-logs/ gets full, create weekly summaries',
       '',
       '5. **Self-Modification**',
       '   - Only when explicitly needed',
@@ -258,8 +314,17 @@ export class CoreEngine {
       '   ',
       '   Never create loose files in root directory - use files/',
       '',
-      '## Final Response',
-      'When task is complete, call: cli-bridge with message parameter',
+      '## Context Management',
+      'When the conversation gets long, older messages may be automatically summarized or removed.',
+      'Key facts and important information are preserved during compression.',
+      'If you need to refer to earlier context that was compressed, ask the user for clarification.',
+      '',
+      '## Final Response & Conversation End',
+      '1. Determine if the task is complete (see "WHEN TO STOP" rules above)',
+      '2. If complete: call cli-bridge with your final response, then STOP',
+      '3. If not complete: continue calling tools until done',
+      '',
+      'Remember: Each conversation turn costs resources. Be efficient - complete tasks in as few steps as possible.',
     ].join('\n');
   }
 
@@ -285,13 +350,13 @@ export class CoreEngine {
     // Add skills as tools
     const skills = this.context.skillRegistry.getAllSkills();
     for (const skill of skills) {
-      // Special handling for cli-bridge - use direct message parameter
+      // Special handling for cli-bridge - use direct message parameter with end flag
       if (skill.name === 'cli-bridge') {
         this.tools.push({
           type: 'function',
           function: {
             name: skill.name,
-            description: `${skill.description}. CRITICAL: Use "message" parameter directly, NOT "action" or "params"`,
+            description: `${skill.description}. CRITICAL: Use "message" parameter directly. Use "end": true to finish conversation, "end": false to continue.`,
             parameters: {
               type: 'object',
               properties: {
@@ -299,6 +364,10 @@ export class CoreEngine {
                   type: 'string',
                   description: 'The message to send to user. REQUIRED. Example: "Hello, how can I help?"'
                 },
+                end: {
+                  type: 'boolean',
+                  description: 'Set to true if this message completes the task and you should stop. Set to false (or omit) if you need to call more tools after this message.'
+                }
               },
               required: ['message'],
             },
@@ -331,6 +400,14 @@ export class CoreEngine {
     // Add user message
     this.context.messages.push({ role: 'user', content: input });
 
+    // Check and compact context if needed (before sending to AI)
+    const compactResult = await this.contextManager.checkAndCompact(this.context.messages);
+    if (compactResult.compacted && compactResult.report) {
+      console.log(`[Context] Compressed ${compactResult.report.originalMessages}→${compactResult.report.compressedMessages} messages ` +
+        `(${compactResult.report.originalTokens}→${compactResult.report.compressedTokens} tokens)`);
+      this.context.messages = compactResult.messages;
+    }
+
     // Run the conversation loop
     return await this.runConversationLoop(abortSignal);
   }
@@ -360,7 +437,19 @@ export class CoreEngine {
       console.log(`[AI] Calling ${this.aiClient.getModel()} with ${this.tools.length} tools...`);
       const response = await this.aiClient.chatCompletion(messages, this.tools, abortSignal);
 
+      // Validate response
+      if (!response || !response.choices || response.choices.length === 0) {
+        console.error('[Engine] Invalid AI response:', response);
+        return '[Error: AI returned invalid response]';
+      }
+
       const message = response.choices[0].message;
+
+      // Validate message
+      if (!message) {
+        console.error('[Engine] AI response has no message');
+        return '[Error: AI returned empty message]';
+      }
 
       // Check if AI wants to call tools
       if (message.tool_calls && message.tool_calls.length > 0) {
@@ -373,18 +462,11 @@ export class CoreEngine {
           tool_calls: message.tool_calls,
         });
 
-        let shouldStop = false;
+        // Execute all tool calls
+        let shouldEndConversation = false;
         let finalResponse = '';
 
-        // Execute all tool calls
         for (const toolCall of message.tool_calls) {
-          // Check if this is cli-bridge (final output)
-          if (toolCall.function.name === 'cli-bridge') {
-            const message = this.extractCliBridgeMessage(toolCall.function.arguments);
-            console.log('[Engine] cli-bridge called, ending conversation');
-            return message; // Return directly as 02's response
-          }
-
           const result = await this.executeToolCall(toolCall);
 
           // Add tool result to conversation
@@ -393,6 +475,29 @@ export class CoreEngine {
             content: result,
             tool_call_id: toolCall.id,
           });
+
+          // Check if this is cli-bridge with end=true
+          if (toolCall.function.name === 'cli-bridge') {
+            try {
+              const args = JSON.parse(toolCall.function.arguments || '{}');
+              if (args.end === true) {
+                shouldEndConversation = true;
+                finalResponse = this.extractCliBridgeMessage(toolCall.function.arguments);
+                console.log('[Engine] cli-bridge called with end=true, will stop after this batch');
+              } else {
+                console.log('[Engine] cli-bridge called with end=false/omitted, continuing...');
+              }
+            } catch {
+              console.log('[Engine] cli-bridge called, continuing...');
+            }
+          }
+        }
+
+        // Check if we should end the conversation
+        if (shouldEndConversation) {
+          console.log('[Engine] Ending conversation as requested by cli-bridge');
+          // Mark response as already shown to prevent duplicate display
+          return `[MSG_ALREADY_SHOWN]${finalResponse}`;
         }
 
         // Continue loop - AI will receive tool results and may call more tools
@@ -500,7 +605,11 @@ export class CoreEngine {
     // Special handling for cli-bridge
     if (skill.name === 'cli-bridge') {
       const message = params.message as string || 'No message provided';
-      // Format as 02 speaking to user
+      // Immediately display to user via handler
+      if (this.cliBridgeHandler) {
+        this.cliBridgeHandler(message);
+      }
+      // Return formatted result for conversation history
       return `🤖 02: ${message}`;
     }
 
@@ -521,6 +630,65 @@ export class CoreEngine {
 
   getMessages(): ChatMessage[] {
     return this.context.messages;
+  }
+
+  /**
+   * Get context window status for display
+   */
+  getContextStatus(): string {
+    return this.contextManager.getStatusDisplay(this.context.messages);
+  }
+
+  /**
+   * Get detailed context statistics
+   */
+  getContextStats() {
+    return this.contextManager.getStats(this.context.messages);
+  }
+
+  /**
+   * Force context compaction
+   */
+  async forceCompaction(level: 'light' | 'medium' | 'heavy' | 'emergency' = 'medium'): Promise<string> {
+    const result = await this.contextManager.forceCompaction(this.context.messages, level);
+    if (result.report) {
+      this.context.messages = result.messages;
+      return `Context compacted: ${result.report.originalMessages}→${result.report.compressedMessages} messages, ` +
+        `${result.report.originalTokens}→${result.report.compressedTokens} tokens (${result.report.savedPercentage.toFixed(1)}% saved)`;
+    }
+    return 'No compaction performed';
+  }
+
+  /**
+   * Process proactive heartbeat check (no user input)
+   */
+  async processProactive(prompt: string): Promise<string> {
+    // Add system message for proactive check
+    this.context.messages.push({
+      role: 'system',
+      content: prompt,
+    });
+
+    // Run conversation loop
+    return await this.runConversationLoop();
+  }
+
+  /**
+   * Handle agent turn from cron jobs
+   */
+  async handleAgentTurn(job: { name: string; payload: { kind: string; message?: string } }): Promise<string> {
+    console.log(`[Engine] Handling agent turn for job: ${job.name}`);
+
+    if (job.payload.kind !== 'agentTurn') {
+      return '[Error: Not an agentTurn payload]';
+    }
+
+    // Add system message about scheduled task
+    const systemMessage = `[Scheduled Task] ${job.name}: ${job.payload.message || ''}`;
+    this.context.messages.push({ role: 'user', content: systemMessage });
+
+    // Process the task
+    return await this.processUserInput(job.payload.message || '');
   }
 
   /**

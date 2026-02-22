@@ -66,7 +66,7 @@ EXAMPLES:
           },
           jobId: {
             type: 'string',
-            description: 'Job ID (required for update, remove, run, pause, resume)',
+            description: 'Job ID (UUID) - REQUIRED for update/remove/run/pause/resume. Get this from the "id" field when listing jobs. Example: "550e8400-e29b-41d4-a716-446655440000"',
           },
           job: {
             type: 'object',
@@ -151,9 +151,14 @@ export async function executeCronTool(
           runCount: j.state.runCount,
         }));
         
+        // Format message with clear ID reference
+        const jobDetails = jobList.map(j => 
+          `[${j.enabled ? '✓' : '✗'}] "${j.name}" (ID: ${j.id}) - ${j.schedule}, Next: ${j.nextRun}`
+        ).join('\n');
+        
         return {
           success: true,
-          message: `Found ${jobs.length} job(s)`,
+          message: `Found ${jobs.length} job(s).\n\n${jobDetails}\n\nTo remove/update a job, use its ID from above. Example: {"action":"remove","jobId":"${jobList[0]?.id || 'uuid'}"}`,
           jobs: jobList as any,
         };
       }
@@ -173,7 +178,10 @@ export async function executeCronTool(
 
       case 'update': {
         if (!params.jobId) {
-          return { success: false, message: 'Job ID required for update action' };
+          return { 
+            success: false, 
+            message: 'Job ID is required. Use "list" action to get the job ID first.' 
+          };
         }
         if (!params.updates) {
           return { success: false, message: 'Updates required for update action' };
@@ -181,61 +189,64 @@ export async function executeCronTool(
         
         const updated = await scheduler.updateJob(params.jobId, params.updates);
         if (!updated) {
-          return { success: false, message: `Job ${params.jobId} not found` };
+          return { success: false, message: `Job ${params.jobId} not found. Use "list" action to see available jobs.` };
         }
         return {
           success: true,
-          message: `Updated job "${updated.name}"`,
+          message: `Updated job "${updated.name}" (ID: ${params.jobId})`,
           job: updated,
         };
       }
 
       case 'remove': {
         if (!params.jobId) {
-          return { success: false, message: 'Job ID required for remove action' };
+          return { 
+            success: false, 
+            message: 'Job ID is required to remove a job. First use "list" action to get the job ID, then use that ID with "remove" action. Example: {"action":"list"} → find id → {"action":"remove","jobId":"the-uuid"}' 
+          };
         }
         
         const removed = await scheduler.removeJob(params.jobId);
         if (!removed) {
-          return { success: false, message: `Job ${params.jobId} not found` };
+          return { success: false, message: `Job ${params.jobId} not found. Use "list" action to see available jobs and their IDs.` };
         }
-        return { success: true, message: `Removed job ${params.jobId}` };
+        return { success: true, message: `Removed job "${removed.name}" (ID: ${params.jobId})` };
       }
 
       case 'run': {
         if (!params.jobId) {
-          return { success: false, message: 'Job ID required for run action' };
+          return { success: false, message: 'Job ID is required. Use "list" action to get the job ID first.' };
         }
         
         const ran = await scheduler.runJobNow(params.jobId);
         if (!ran) {
-          return { success: false, message: `Job ${params.jobId} not found` };
+          return { success: false, message: `Job ${params.jobId} not found. Use "list" action to see available jobs.` };
         }
         return { success: true, message: `Executed job ${params.jobId}` };
       }
 
       case 'pause': {
         if (!params.jobId) {
-          return { success: false, message: 'Job ID required for pause action' };
+          return { success: false, message: 'Job ID is required. Use "list" action to get the job ID first.' };
         }
         
         const paused = await scheduler.updateJob(params.jobId, { enabled: false });
         if (!paused) {
-          return { success: false, message: `Job ${params.jobId} not found` };
+          return { success: false, message: `Job ${params.jobId} not found. Use "list" action to see available jobs.` };
         }
-        return { success: true, message: `Paused job "${paused.name}"` };
+        return { success: true, message: `Paused job "${paused.name}" (ID: ${params.jobId})` };
       }
 
       case 'resume': {
         if (!params.jobId) {
-          return { success: false, message: 'Job ID required for resume action' };
+          return { success: false, message: 'Job ID is required. Use "list" action to get the job ID first.' };
         }
         
         const resumed = await scheduler.updateJob(params.jobId, { enabled: true });
         if (!resumed) {
-          return { success: false, message: `Job ${params.jobId} not found` };
+          return { success: false, message: `Job ${params.jobId} not found. Use "list" action to see available jobs.` };
         }
-        return { success: true, message: `Resumed job "${resumed.name}"` };
+        return { success: true, message: `Resumed job "${resumed.name}" (ID: ${params.jobId})` };
       }
 
       default:
