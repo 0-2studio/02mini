@@ -1,6 +1,6 @@
 /**
  * MCP Manager
- * Manages multiple MCP server connections
+ * Manages multiple MCP server connections using official SDK
  */
 
 import fs from 'fs/promises';
@@ -24,51 +24,49 @@ export class MCPManager {
 
   async initialize(): Promise<void> {
     // Load config if not already loaded
-    let configLoaded = false;
-    
     if (!this.config) {
-      const defaultPaths = [
+      const configPaths = [
         './mcp-config.json',
         path.join(process.cwd(), 'mcp-config.json'),
       ];
 
-      for (const configPath of defaultPaths) {
+      for (const configPath of configPaths) {
         try {
-          const content = await fs.readFile(configPath, 'utf-8');
-          this.config = JSON.parse(content) as MCPConfig;
-          if (Object.keys(this.config.mcpServers).length > 0) {
+          await this.loadConfig(configPath);
+          if (Object.keys(this.config?.mcpServers || {}).length > 0) {
             console.log(`[MCP] Loaded config from ${configPath}`);
-            configLoaded = true;
             break;
           }
         } catch {
           // Continue to next path
         }
       }
-    } else {
-      configLoaded = true;
     }
 
-    if (!configLoaded || !this.config) {
-      console.log('[MCP] No MCP configuration loaded');
-      return;
-    }
-
-    if (Object.keys(this.config.mcpServers).length === 0) {
+    if (!this.config || Object.keys(this.config.mcpServers).length === 0) {
       console.log('[MCP] No MCP servers configured');
       return;
     }
 
-    for (const [name, serverConfig] of Object.entries(this.config.mcpServers)) {
-      try {
-        const client = new MCPClient(name, serverConfig);
-        await client.connect();
-        this.clients.set(name, client);
-        console.log(`[MCP] Connected to server: ${name}`);
-      } catch (error) {
-        console.error(`[MCP] Failed to connect to ${name}:`, error);
-      }
-    }
+    // Connect to all servers
+    console.log(`[MCP] Connecting to ${Object.keys(this.config.mcpServers).length} server(s)...`);
+
+    const results = await Promise.allSettled(
+      Object.entries(this.config.mcpServers).map(async ([name, serverConfig]) => {
+        try {
+          const client = new MCPClient(name, serverConfig);
+          await client.connect();
+          this.clients.set(name, client);
+          console.log(`[MCP] ✓ Connected to server: ${name}`);
+        } catch (error) {
+          console.error(`[MCP] ✗ Failed to connect to ${name}:`, error);
+        }
+      })
+    );
+
+    const connected = this.clients.size;
+    const total = Object.keys(this.config.mcpServers).length;
+    console.log(`[MCP] Connected: ${connected}/${total} servers`);
   }
 
   getAllTools(): Array<{ server: string; tool: MCPTool }> {
@@ -87,15 +85,19 @@ export class MCPManager {
     toolName: string,
     args: Record<string, unknown>
   ): Promise<MCPCallToolResult> {
+    // Try to find the tool in any connected server
     for (const [serverName, client] of this.clients) {
       if (!client.isReady()) continue;
+
       const tools = client.getTools();
       const tool = tools.find(t => t.name === toolName);
+
       if (tool) {
         console.log(`[MCP] Calling ${toolName} on server ${serverName}`);
         return await client.callTool(toolName, args);
       }
     }
+
     throw new Error(`Tool '${toolName}' not found in any connected MCP server`);
   }
 

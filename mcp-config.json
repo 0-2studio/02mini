@@ -2,19 +2,14 @@
   "mcpServers": {
     "filesystem": {
       "command": "npx",
-      "args": [
-        "-y",
-        "@modelcontextprotocol/server-filesystem",
-        "."
-      ]
+      "args": ["-y", "@modelcontextprotocol/server-filesystem", "."]
     },
-    "cli": {
+    "fetch": {
       "command": "npx",
-      "args": [
-        "-y",
-        "@anthropics/anthropic-mcp"
-      ],
-      "env": {}
+      "args": ["mcp-fetch-server"],
+      "env": {
+        "DEFAULT_LIMIT": "50000"
+      }
     }
   }
 }

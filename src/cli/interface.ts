@@ -1,14 +1,59 @@
 /**
  * CLI Interface
- * Command line interface for 02
+ * Beautiful command line interface for 02
  */
 
 import readline from 'readline';
-import { CoreEngine, type Message } from '../core/engine.js';
+import { CoreEngine } from '../core/engine.js';
 import { MCPManager, mcpManager } from '../mcp/manager.js';
 import { SkillRegistry } from '../skills-impl/skill-registry.js';
+import { AIClient } from '../ai/client.js';
+import { CronScheduler } from '../cron/index.js';
 import fs from 'fs/promises';
 import path from 'path';
+
+// ANSI color codes
+const colors = {
+  reset: '\x1b[0m',
+  bright: '\x1b[1m',
+  dim: '\x1b[2m',
+  italic: '\x1b[3m',
+  underline: '\x1b[4m',
+  
+  // Foreground colors
+  black: '\x1b[30m',
+  red: '\x1b[31m',
+  green: '\x1b[32m',
+  yellow: '\x1b[33m',
+  blue: '\x1b[34m',
+  magenta: '\x1b[35m',
+  cyan: '\x1b[36m',
+  white: '\x1b[37m',
+  
+  // Bright colors
+  brightRed: '\x1b[91m',
+  brightGreen: '\x1b[92m',
+  brightYellow: '\x1b[93m',
+  brightBlue: '\x1b[94m',
+  brightMagenta: '\x1b[95m',
+  brightCyan: '\x1b[96m',
+  brightWhite: '\x1b[97m',
+  
+  // Background colors
+  bgBlack: '\x1b[40m',
+  bgRed: '\x1b[41m',
+  bgGreen: '\x1b[42m',
+  bgYellow: '\x1b[43m',
+  bgBlue: '\x1b[44m',
+  bgMagenta: '\x1b[45m',
+  bgCyan: '\x1b[46m',
+  bgWhite: '\x1b[47m',
+};
+
+// Helper functions
+const c = (text: string, color: keyof typeof colors) => `${colors[color]}${text}${colors.reset}`;
+const bold = (text: string) => c(text, 'bright');
+const dim = (text: string) => c(text, 'dim');
 
 export class CLIInterface {
   private rl?: readline.Interface;
@@ -16,151 +61,438 @@ export class CLIInterface {
   private mcpManager: MCPManager;
   private skillRegistry: SkillRegistry;
   private workingDir: string;
+  private cronScheduler: CronScheduler;
 
-  constructor(workingDir: string) {
+  constructor(workingDir: string, cronScheduler: CronScheduler) {
     this.workingDir = workingDir;
+    this.cronScheduler = cronScheduler;
     this.mcpManager = mcpManager;
     this.skillRegistry = new SkillRegistry(path.join(workingDir, 'skills'));
   }
 
   async start(): Promise<void> {
     console.clear();
-    console.log('╔══════════════════════════════════════╗');
-    console.log('║                                      ║');
-    console.log('║     02 - Self-Aware AI System        ║');
-    console.log('║                                      ║');
-    console.log('╚══════════════════════════════════════╝');
-    console.log();
-
+    
+    // Beautiful header
+    this.printHeader();
+    
     // Initialize
     await this.initialize();
+    
+    // Print help hint
+    console.log(dim('\n💡 Type "/help" for available commands\n'));
 
     // Start CLI
     this.rl = readline.createInterface({
       input: process.stdin,
       output: process.stdout,
+      prompt: c('\n❯ ', 'brightCyan') + ' ',
     });
 
-    console.log('\nType your message (or "exit" to quit):\n');
-    this.prompt();
+    this.rl.prompt();
+    
+    // Track if we're currently processing
+    let isProcessing = false;
+    let abortController: AbortController | null = null;
+    
+    // Handle keypress for ESC
+    process.stdin.on('keypress', (str, key) => {
+      if (key.name === 'escape' && isProcessing && abortController) {
+        console.log(dim('\n\n[Interrupted by user]'));
+        abortController.abort();
+      }
+    });
+    
+    // Enable keypress events
+    if (process.stdin.isTTY) {
+      process.stdin.setRawMode(true);
+      readline.emitKeypressEvents(process.stdin);
+    }
+    
+    this.rl.on('line', async (input) => {
+      const trimmed = input.trim();
+      
+      if (trimmed === '') {
+        this.rl?.prompt();
+        return;
+      }
+
+      // Handle commands
+      if (trimmed.startsWith('/')) {
+        await this.handleCommand(trimmed);
+        this.rl?.prompt();
+        return;
+      }
+
+      // Process regular input
+      if (this.engine) {
+        isProcessing = true;
+        abortController = new AbortController();
+        
+        try {
+          this.showThinking();
+          console.log(dim('\n(Press ESC to interrupt)'));
+          
+          const response = await this.engine.processUserInput(trimmed, abortController.signal);
+          this.hideThinking();
+          
+          if (!abortController.signal.aborted) {
+            this.printResponse(response);
+          }
+        } catch (error) {
+          this.hideThinking();
+          if ((error as Error).name === 'AbortError') {
+            console.log(dim('\n[Response interrupted]'));
+          } else {
+            this.printError(error instanceof Error ? error.message : String(error));
+          }
+        } finally {
+          isProcessing = false;
+          abortController = null;
+        }
+      }
+
+      this.rl?.prompt();
+    });
+
+    this.rl.on('close', () => {
+      this.shutdown();
+    });
+  }
+
+  private printHeader(): void {
+    const width = 50;
+    const line = '─'.repeat(width);
+    
+    console.log();
+    console.log(c('  ╭' + line + '╮', 'brightCyan'));
+    console.log(c('  │', 'brightCyan') + ' '.repeat(width) + c('│', 'brightCyan'));
+    console.log(c('  │', 'brightCyan') + c('     🤖 02 - Self-Aware AI System'.padEnd(width), 'brightWhite') + c('│', 'brightCyan'));
+    console.log(c('  │', 'brightCyan') + c('        Your Intelligent Assistant'.padEnd(width), 'dim') + c('│', 'brightCyan'));
+    console.log(c('  │', 'brightCyan') + ' '.repeat(width) + c('│', 'brightCyan'));
+    console.log(c('  ╰' + line + '╯', 'brightCyan'));
+    console.log();
   }
 
   private async initialize(): Promise<void> {
+    console.log(c('🔌 Initializing system...\n', 'brightYellow'));
+
     // Load MCP
-    console.log('[Init] Loading MCP servers...');
+    console.log(dim('  • Connecting to MCP servers...'));
     await this.mcpManager.initialize();
 
     // Discover skills
-    console.log('[Init] Discovering skills...');
+    console.log(dim('  • Discovering skills...'));
     await this.skillRegistry.discoverSkills();
 
+    // Initialize AI client
+    console.log(dim('  • Initializing AI client...'));
+    const aiClient = AIClient.fromEnv();
+    console.log(c(`  ✓ AI Model: ${aiClient.getModel()}`, 'green'));
+
     // Create engine
-    console.log('[Init] Starting core engine...');
+    console.log(dim('  • Starting core engine...'));
     this.engine = new CoreEngine({
       messages: [],
       mcpManager: this.mcpManager,
       skillRegistry: this.skillRegistry,
       workingDir: this.workingDir,
+      aiClient,
+      cronScheduler: this.cronScheduler,
     });
 
-    // Show loaded skills
-    const skills = this.skillRegistry.getAllSkills();
-    console.log(`\n[Init] Loaded ${skills.length} skills:`);
-    for (const skill of skills) {
-      console.log(`  • ${skill.name}`);
-    }
+    // Listen for cron events and forward to engine
+    this.cronScheduler.on('systemEvent', async () => {
+      if (this.engine) {
+        await this.engine.checkCronEvents();
+      }
+    });
 
-    // Show MCP servers
-    const servers = this.mcpManager.getConnectedServers();
-    console.log(`\n[Init] Connected MCP servers:`);
-    for (const server of servers) {
-      console.log(`  • ${server}`);
-    }
+    this.cronScheduler.on('agentTurn', async (job) => {
+      if (this.engine) {
+        console.log(c('\n[Scheduled Task]', 'brightYellow'), job.name);
+        await this.engine.handleAgentTurn(job);
+      }
+    });
 
-    console.log('\n[Init] Ready!\n');
+    // Show status
+    await this.printStatus();
   }
 
-  private prompt(): void {
-    this.rl?.question('You: ', async (input) => {
-      if (input.toLowerCase() === 'exit') {
+  private async printStatus(): Promise<void> {
+    const skills = this.skillRegistry.getAllSkills();
+    const servers = this.mcpManager.getConnectedServers();
+    const tools = this.mcpManager.getAllTools();
+
+    console.log();
+    console.log(c('┌─ System Status ─────────────────────────┐', 'brightBlue'));
+    console.log(c('│', 'brightBlue') + `  ${c('✓', 'brightGreen')} ${skills.length.toString().padStart(2)} Skills Loaded          ${c('│', 'brightBlue')}`);
+    console.log(c('│', 'brightBlue') + `  ${c('✓', 'brightGreen')} ${servers.length.toString().padStart(2)} MCP Servers Connected  ${c('│', 'brightBlue')}`);
+    console.log(c('│', 'brightBlue') + `  ${c('✓', 'brightGreen')} ${tools.length.toString().padStart(2)} Tools Available        ${c('│', 'brightBlue')}`);
+    console.log(c('└─────────────────────────────────────────┘', 'brightBlue'));
+    console.log();
+
+    // Show tools if available
+    if (tools.length > 0) {
+      console.log(c('Available Tools:', 'brightMagenta'));
+      for (const { server, tool } of tools.slice(0, 6)) {
+        console.log(`  ${c('•', 'brightCyan')} ${tool.name} ${dim(`(${server})`)}`);
+      }
+      if (tools.length > 6) {
+        console.log(dim(`  ... and ${tools.length - 6} more`));
+      }
+      console.log();
+    }
+
+    console.log(c('✨ Ready for conversation!\n', 'brightGreen'));
+  }
+
+  private async handleCommand(cmd: string): Promise<void> {
+    const parts = cmd.split(' ');
+    const command = parts[0].toLowerCase();
+
+    switch (command) {
+      case '/exit':
+      case '/quit':
         await this.shutdown();
-        return;
-      }
-
-      if (input.toLowerCase() === 'skills') {
+        break;
+      
+      case '/help':
+        this.printHelp();
+        break;
+      
+      case '/skills':
         this.listSkills();
-        this.prompt();
-        return;
-      }
-
-      if (input.toLowerCase() === 'mcp') {
+        break;
+      
+      case '/mcp':
         this.listMCPTools();
-        this.prompt();
-        return;
-      }
-
-      if (input.toLowerCase().startsWith('read ')) {
-        const file = input.slice(5).trim();
-        await this.readFile(file);
-        this.prompt();
-        return;
-      }
-
-      // Process input
-      if (this.engine) {
-        try {
-          const response = await this.engine.processUserInput(input);
-          // Send via cli-bridge (in real implementation)
-          console.log(`\n02: ${response}\n`);
-        } catch (error) {
-          console.error('Error:', error);
+        break;
+      
+      case '/status':
+        await this.printStatus();
+        break;
+      
+      case '/clear':
+        console.clear();
+        this.printHeader();
+        break;
+      
+      case '/read':
+        if (parts[1]) {
+          const filePath = parts.slice(1).join(' ');
+          await this.readFile(filePath);
+        } else {
+          this.printError('Usage: /read <filepath>');
         }
-      }
+        break;
+      
+      case '/memory':
+        await this.listMemoryFiles();
+        break;
+      
+      case '/reset':
+        await this.resetAI();
+        break;
+      
+      default:
+        this.printError(`Unknown command: ${command}`);
+        console.log(dim('Type /help for available commands'));
+    }
+  }
 
-      this.prompt();
-    });
+  private printHelp(): void {
+    console.log();
+    console.log(c('┌─ Available Commands ────────────────────┐', 'brightBlue'));
+    console.log(c('│', 'brightBlue') + '  /help      - Show this help message     ' + c('│', 'brightBlue'));
+    console.log(c('│', 'brightBlue') + '  /skills    - List all available skills  ' + c('│', 'brightBlue'));
+    console.log(c('│', 'brightBlue') + '  /mcp       - List all MCP tools         ' + c('│', 'brightBlue'));
+    console.log(c('│', 'brightBlue') + '  /status    - Show system status         ' + c('│', 'brightBlue'));
+    console.log(c('│', 'brightBlue') + '  /read      - Read a file                ' + c('│', 'brightBlue'));
+    console.log(c('│', 'brightBlue') + '  /memory    - List memory files          ' + c('│', 'brightBlue'));
+    console.log(c('│', 'brightBlue') + '  /reset     - Reset all AI data (DANGER) ' + c('│', 'brightBlue'));
+    console.log(c('│', 'brightBlue') + '  /clear     - Clear the screen           ' + c('│', 'brightBlue'));
+    console.log(c('│', 'brightBlue') + '  /exit      - Exit the application       ' + c('│', 'brightBlue'));
+    console.log(c('└─────────────────────────────────────────┘', 'brightBlue'));
+    console.log();
   }
 
   private listSkills(): void {
     const skills = this.skillRegistry.getAllSkills();
-    console.log('\n--- Available Skills ---');
+    console.log();
+    console.log(c('┌─ Available Skills ──────────────────────┐', 'brightMagenta'));
+    
     for (const skill of skills) {
-      console.log(`\n${skill.name}:`);
-      console.log(`  ${skill.description}`);
-      console.log(`  Triggers: ${skill.triggers.join(', ')}`);
+      const name = skill.name.padEnd(15);
+      console.log(c('│', 'brightMagenta') + `  ${c('•', 'brightCyan')} ${c(name, 'brightWhite')}${c('│', 'brightMagenta')}`);
+      console.log(c('│', 'brightMagenta') + `    ${dim(skill.description.slice(0, 35))}${c('│', 'brightMagenta')}`);
+      if (skill !== skills[skills.length - 1]) {
+        console.log(c('│', 'brightMagenta') + ' '.repeat(41) + c('│', 'brightMagenta'));
+      }
     }
-    console.log('');
+    
+    console.log(c('└─────────────────────────────────────────┘', 'brightMagenta'));
+    console.log();
   }
 
   private listMCPTools(): void {
     const tools = this.mcpManager.getAllTools();
-    console.log('\n--- Available MCP Tools ---');
+    console.log();
+    console.log(c('┌─ Available MCP Tools ───────────────────┐', 'brightCyan'));
+    
     for (const { server, tool } of tools) {
-      console.log(`\n[${server}] ${tool.name}:`);
-      console.log(`  ${tool.description}`);
+      const name = `${server}_${tool.name}`.slice(0, 25).padEnd(25);
+      console.log(c('│', 'brightCyan') + `  ${c('•', 'brightGreen')} ${name}${c('│', 'brightCyan')}`);
     }
-    console.log('');
+    
+    console.log(c('└─────────────────────────────────────────┘', 'brightCyan'));
+    console.log();
+  }
+
+  private async listMemoryFiles(): Promise<void> {
+    const memoryPath = path.join(this.workingDir, 'memory');
+    
+    try {
+      const entries = await fs.readdir(memoryPath, { withFileTypes: true });
+      console.log();
+      console.log(c('┌─ Memory Files ──────────────────────────┐', 'brightYellow'));
+      
+      for (const entry of entries) {
+        if (entry.isDirectory()) {
+          console.log(c('│', 'brightYellow') + `  ${c('📁', 'brightBlue')} ${entry.name.padEnd(33)}${c('│', 'brightYellow')}`);
+        } else if (entry.name.endsWith('.md')) {
+          console.log(c('│', 'brightYellow') + `  ${c('📝', 'brightGreen')} ${entry.name.padEnd(33)}${c('│', 'brightYellow')}`);
+        }
+      }
+      
+      console.log(c('└─────────────────────────────────────────┘', 'brightYellow'));
+      console.log();
+    } catch (error) {
+      this.printError('Failed to read memory directory');
+    }
   }
 
   private async readFile(filePath: string): Promise<void> {
+    console.log();
+    console.log(dim(`Reading: ${filePath}`));
+    
     try {
       const result = await this.mcpManager.callTool('read_file', { path: filePath });
+      
       if (result.isError) {
-        console.log(`\nError reading file: ${result.content[0]?.text}\n`);
+        this.printError(result.content[0]?.text || 'Unknown error');
       } else {
-        console.log(`\n--- ${filePath} ---`);
+        console.log();
+        console.log(c('┌─ File Content ──────────────────────────┐', 'brightBlue'));
         console.log(result.content[0]?.text || 'Empty file');
-        console.log('');
+        console.log(c('└─────────────────────────────────────────┘', 'brightBlue'));
       }
     } catch (error) {
-      console.log(`\nError: ${error}\n`);
+      this.printError(error instanceof Error ? error.message : String(error));
+    }
+    console.log();
+  }
+
+  private showThinking(): void {
+    process.stdout.write(c('\n💭 ', 'brightYellow'));
+    process.stdout.write(c('Thinking', 'dim'));
+    
+    // Animated dots
+    let dots = 0;
+    const interval = setInterval(() => {
+      dots = (dots + 1) % 4;
+      process.stdout.write('\r' + c('💭 ', 'brightYellow') + c('Thinking' + '.'.repeat(dots), 'dim') + ' '.repeat(3));
+    }, 500);
+    
+    (this as any).thinkingInterval = interval;
+  }
+
+  private hideThinking(): void {
+    const interval = (this as any).thinkingInterval;
+    if (interval) {
+      clearInterval(interval);
+      (this as any).thinkingInterval = null;
+    }
+    process.stdout.write('\r' + ' '.repeat(20) + '\r');
+  }
+
+  private printResponse(response: string): void {
+    console.log();
+    console.log(c('┌─ 02 ────────────────────────────────────┐', 'brightGreen'));
+    console.log();
+    
+    // Clean up the response
+    let cleanResponse = response
+      .replace(/\[CLI Output\] /g, '')
+      .replace(/\[Error: /g, c('[Error: ', 'red'))
+      .trim();
+    
+    // Print with word wrapping
+    const lines = cleanResponse.split('\n');
+    for (const line of lines) {
+      console.log('  ' + line);
+    }
+    
+    console.log();
+    console.log(c('└─────────────────────────────────────────┘', 'brightGreen'));
+    console.log();
+  }
+
+  private printError(message: string): void {
+    console.log();
+    console.log(c('┌─ Error ─────────────────────────────────┐', 'brightRed'));
+    console.log(c('│', 'brightRed') + '  ' + c(message.slice(0, 37), 'brightRed').padEnd(39) + c('│', 'brightRed'));
+    console.log(c('└─────────────────────────────────────────┘', 'brightRed'));
+    console.log();
+  }
+
+  private async resetAI(): Promise<void> {
+    console.log();
+    console.log(c('⚠️  WARNING: This will erase all memories and conversation history!', 'brightRed'));
+    console.log(dim('The AI will be reset to factory settings.\n'));
+    
+    // Ask for confirmation
+    const answer = await new Promise<string>((resolve) => {
+      this.rl?.question(c('Are you sure? Type "yes" to confirm: ', 'brightYellow'), (input) => {
+        resolve(input.trim().toLowerCase());
+      });
+    });
+    
+    if (answer !== 'yes') {
+      console.log(dim('\nReset cancelled.'));
+      return;
+    }
+    
+    console.log();
+    console.log(c('🔄 Resetting AI data...', 'brightYellow'));
+    
+    if (this.engine) {
+      const result = await this.engine.resetAllData();
+      
+      if (result.success) {
+        console.log();
+        console.log(c('┌─ Reset Complete ────────────────────────┐', 'brightGreen'));
+        console.log(c('│', 'brightGreen') + '  ' + c('✓ All memories erased', 'brightWhite').padEnd(39) + c('│', 'brightGreen'));
+        console.log(c('│', 'brightGreen') + '  ' + c('✓ Conversation history cleared', 'brightWhite').padEnd(39) + c('│', 'brightGreen'));
+        console.log(c('│', 'brightGreen') + '  ' + c('✓ AI reset to factory settings', 'brightWhite').padEnd(39) + c('│', 'brightGreen'));
+        console.log(c('└─────────────────────────────────────────┘', 'brightGreen'));
+        console.log();
+        console.log(c('🤖 02: I have been reset. Hello, I am 02, ready to assist you!', 'brightCyan'));
+        console.log();
+      } else {
+        this.printError(result.message);
+      }
     }
   }
 
   private async shutdown(): Promise<void> {
-    console.log('\n[Shutdown] Disconnecting MCP...');
+    console.log();
+    console.log(dim('Shutting down...'));
+    
     this.mcpManager.disconnectAll();
-    console.log('[Shutdown] Goodbye!\n');
+    
+    console.log(c('👋 Goodbye!\n', 'brightYellow'));
+    
     this.rl?.close();
     process.exit(0);
   }

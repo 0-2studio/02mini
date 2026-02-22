@@ -7,11 +7,11 @@ Skills are executable capabilities defined in the `skills/` directory. Each skil
 ## Skill Structure
 
 ```
-skills/
-└── skill-name/
-    ├── SKILL.md          # Required: Skill definition
-    └── scripts/          # Optional: Executable scripts
-        └── script.sh     # Scripts the skill can run
+my-skill/
+├── SKILL.md          # Required: instructions + metadata
+├── scripts/          # Optional: executable code
+├── references/       # Optional: documentation
+└── assets/           # Optional: templates, resources
 ```
 
 ## How to Use Skills
@@ -117,12 +117,15 @@ Scripts:
 
 ### How to Create
 
-1. Call skill-creator skill
-2. Provide:
-   - Skill name (lowercase-with-dashes)
-   - Clear description
-   - When to use it
-   - Step-by-step instructions
+1. Create skill directory with this structure:
+   ```
+   skills/my-skill/
+   ├── SKILL.md          # Required: instructions + metadata
+   ├── scripts/          # Optional: executable code
+   ├── references/       # Optional: documentation
+   └── assets/           # Optional: templates, resources
+   ```
+2. Write SKILL.md with frontmatter and instructions
 3. Test the new skill
 4. Document in memory/
 

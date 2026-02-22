@@ -1,37 +1,17 @@
 /**
  * MCP Client
- * Client for communicating with MCP servers via stdio
+ * Client for communicating with MCP servers using official SDK
  */
 
-import { spawn, type ChildProcess } from 'child_process';
+import { Client } from '@modelcontextprotocol/sdk/client/index.js';
+import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
+import { ListToolsResultSchema, CallToolResultSchema } from '@modelcontextprotocol/sdk/types.js';
 import { EventEmitter } from 'events';
 import type { MCPServerConfig, MCPTool, MCPCallToolResult } from './types.js';
 
-interface JSONRPCRequest {
-  jsonrpc: '2.0';
-  id: number;
-  method: string;
-  params?: unknown;
-}
-
-interface JSONRPCResponse {
-  jsonrpc: '2.0';
-  id: number;
-  result?: unknown;
-  error?: {
-    code: number;
-    message: string;
-  };
-}
-
 export class MCPClient extends EventEmitter {
-  private process?: ChildProcess;
-  private requestId = 0;
-  private pendingRequests = new Map<number, {
-    resolve: (value: unknown) => void;
-    reject: (error: Error) => void;
-  }>();
-  private buffer = '';
+  private client?: Client;
+  private transport?: StdioClientTransport;
   private tools: MCPTool[] = [];
   private ready = false;
 
@@ -43,131 +23,83 @@ export class MCPClient extends EventEmitter {
   }
 
   async connect(): Promise<void> {
-    return new Promise((resolve, reject) => {
-      const { command, args, env } = this.config;
+    try {
+      // Create client
+      this.client = new Client(
+        { name: '02mini-mcp-client', version: '1.0.0' },
+        { capabilities: {} }
+      );
 
-      const resolvedEnv: Record<string, string> = {};
-      if (env) {
-        for (const [key, value] of Object.entries(env)) {
-          resolvedEnv[key] = value.replace(/\$\{([^}]+)\}/g, (_, varName) => {
-            return process.env[varName] || '';
-          });
-        }
+      // Create transport
+      this.transport = new StdioClientTransport({
+        command: this.config.command,
+        args: this.config.args,
+        env: { ...process.env, ...(this.config.env || {}) } as Record<string, string>,
+      });
+
+      // Connect with timeout
+      const connectPromise = this.client.connect(this.transport);
+      const timeoutPromise = new Promise((_, reject) => {
+        setTimeout(() => reject(new Error('Connection timeout')), 10000);
+      });
+
+      await Promise.race([connectPromise, timeoutPromise]);
+
+      // List tools
+      const toolsResponse = await this.client.request(
+        { method: 'tools/list' },
+        ListToolsResultSchema
+      );
+
+      this.tools = toolsResponse.tools.map((tool: any) => ({
+        name: tool.name,
+        description: tool.description,
+        inputSchema: tool.inputSchema,
+      }));
+
+      this.ready = true;
+      console.log(`[MCP:${this.name}] Connected with ${this.tools.length} tools`);
+
+      // Log available tools
+      for (const tool of this.tools) {
+        console.log(`[MCP:${this.name}]  - ${tool.name}`);
       }
 
-      this.process = spawn(command, args, {
-        stdio: ['pipe', 'pipe', 'pipe'],
-        env: { ...process.env, ...resolvedEnv },
-      });
-
-      this.process.stdout?.on('data', (data: Buffer) => {
-        this.buffer += data.toString();
-        this.processBuffer();
-      });
-
-      this.process.stderr?.on('data', (data: Buffer) => {
-        const log = data.toString().trim();
-        if (log) {
-          console.log(`[MCP:${this.name}] ${log}`);
-        }
-      });
-
-      this.process.on('exit', (code) => {
-        this.ready = false;
-        this.emit('disconnect', code);
-        for (const pending of this.pendingRequests.values()) {
-          pending.reject(new Error(`MCP server ${this.name} disconnected`));
-        }
-        this.pendingRequests.clear();
-      });
-
-      this.process.on('error', (error) => {
-        reject(new Error(`Failed to start MCP server ${this.name}: ${error.message}`));
-      });
-
-      setTimeout(async () => {
-        try {
-          await this.initialize();
-          this.ready = true;
-          resolve();
-        } catch (error) {
-          reject(error);
-        }
-      }, 1000);
-    });
-  }
-
-  private async initialize(): Promise<void> {
-    await this.sendRequest('initialize', {
-      protocolVersion: '2024-11-05',
-      capabilities: { tools: {} },
-      clientInfo: { name: '02', version: '1.0.0' },
-    });
-
-    const result = await this.sendRequest('tools/list', {}) as { tools: MCPTool[] };
-    this.tools = result.tools || [];
-    console.log(`[MCP:${this.name}] Connected with ${this.tools.length} tools`);
-  }
-
-  private processBuffer(): void {
-    const lines = this.buffer.split('\n');
-    this.buffer = lines.pop() || '';
-
-    for (const line of lines) {
-      const trimmed = line.trim();
-      if (!trimmed) continue;
-
-      try {
-        const message = JSON.parse(trimmed) as JSONRPCResponse;
-        if (message.id !== undefined) {
-          const pending = this.pendingRequests.get(message.id);
-          if (pending) {
-            this.pendingRequests.delete(message.id);
-            if (message.error) {
-              pending.reject(new Error(message.error.message));
-            } else {
-              pending.resolve(message.result);
-            }
-          }
-        }
-      } catch {
-        // Invalid JSON
-      }
+      this.emit('connected', { name: this.name, tools: this.tools.length });
+    } catch (error) {
+      console.error(`[MCP:${this.name}] Connection failed:`, error);
+      this.emit('error', error);
+      throw error;
     }
   }
 
-  private sendRequest(method: string, params: unknown): Promise<unknown> {
-    return new Promise((resolve, reject) => {
-      if (!this.process?.stdin || !this.ready) {
-        reject(new Error(`MCP client ${this.name} not connected`));
-        return;
-      }
+  async callTool(toolName: string, args: Record<string, unknown>): Promise<MCPCallToolResult> {
+    if (!this.client || !this.ready) {
+      throw new Error(`MCP client ${this.name} not connected`);
+    }
 
-      const id = ++this.requestId;
-      const request: JSONRPCRequest = {
-        jsonrpc: '2.0',
-        id,
-        method,
-        params,
+    try {
+      const result = await this.client.request(
+        {
+          method: 'tools/call',
+          params: {
+            name: toolName,
+            arguments: args,
+          },
+        },
+        CallToolResultSchema
+      );
+
+      return {
+        content: result.content as Array<{ type: 'text'; text: string }>,
+        isError: false,
       };
-
-      this.pendingRequests.set(id, { resolve, reject });
-      this.process.stdin.write(JSON.stringify(request) + '\n');
-
-      setTimeout(() => {
-        if (this.pendingRequests.has(id)) {
-          this.pendingRequests.delete(id);
-          reject(new Error(`Request timeout: ${method}`));
-        }
-      }, 60000);
-    });
-  }
-
-  async callTool(name: string, args: Record<string, unknown>): Promise<MCPCallToolResult> {
-    return await this.sendRequest('tools/call', {
-      name,
-      arguments: args,
-    }) as MCPCallToolResult;
+    } catch (error) {
+      return {
+        content: [{ type: 'text', text: String(error) }],
+        isError: true,
+      };
+    }
   }
 
   getTools(): MCPTool[] {
@@ -180,13 +112,11 @@ export class MCPClient extends EventEmitter {
 
   disconnect(): void {
     this.ready = false;
-    if (this.process) {
-      this.process.kill();
-      this.process = undefined;
+    if (this.client) {
+      this.client.close().catch(() => {});
+      this.client = undefined;
     }
-    for (const pending of this.pendingRequests.values()) {
-      pending.reject(new Error('MCP client disconnected'));
-    }
-    this.pendingRequests.clear();
+    this.transport = undefined;
+    this.tools = [];
   }
 }

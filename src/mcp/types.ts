@@ -35,7 +35,8 @@ export interface MCPCallToolResult {
 
 export interface MCPConnection {
   name: string;
-  process: import('child_process').ChildProcess;
+  client: import('@modelcontextprotocol/sdk/client/index.js').Client;
+  transport: import('@modelcontextprotocol/sdk/client/stdio.js').StdioClientTransport;
   tools: MCPTool[];
-  ready: boolean;
+  status: string;
 }

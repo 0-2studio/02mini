@@ -3,6 +3,7 @@ node_modules/
 package-lock.json
 yarn.lock
 pnpm-lock.yaml
+bun.lockb
 
 # Build output
 build/
@@ -40,3 +41,8 @@ memory/knowledge/*.md
 !memory/self-reflections/.gitkeep
 !memory/daily-logs/.gitkeep
 !memory/knowledge/.gitkeep
+
+# User files (generated content)
+files/*
+!files/README.md
+!files/.gitkeep

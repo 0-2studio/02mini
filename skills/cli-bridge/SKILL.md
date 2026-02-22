@@ -31,106 +31,87 @@ Send messages to the user through the CLI interface.
 
 ## How to Use
 
-### Step 1: Prepare Message
+### CORRECT Format (USE THIS)
 
-Decide what to send:
-- Response to user query
-- Question you need answered
-- Information you want to share
-- Status update
+Call the cli-bridge tool with this exact parameter structure:
 
-### Step 2: Choose Message Type
-
-- `response`: Normal reply (default)
-- `thinking`: Show your thought process
-- `error`: Something went wrong
-- `question`: You need user input
-
-### Step 3: Execute Send Script
-
-```javascript
+```json
 {
-  "type": "send",
-  "content": "Your message here",
-  "messageType": "response" // or "thinking", "error", "question"
+  "message": "Your message here to the user"
 }
 ```
 
-## Examples
+### Examples
 
-### Example 1: Simple Response
+#### Example 1: Simple Response
 **Situation**: User asked "Hello"
-**Action**: Send greeting
-```javascript
+**Action**: 
+```json
 {
-  "type": "send",
-  "content": "Hello! I'm 02. How can I help you today?",
-  "messageType": "response"
+  "message": "Hello! I'm 02. How can I help you today?"
 }
 ```
 
-### Example 2: Asking Question
+#### Example 2: Asking Question
 **Situation**: Need more information
-**Action**: Ask user
-```javascript
+**Action**:
+```json
 {
-  "type": "send",
-  "content": "What file would you like me to read?",
-  "messageType": "question"
+  "message": "What file would you like me to read?"
 }
 ```
 
-### Example 3: Showing Thinking
-**Situation**: Complex task
-**Action**: Share thought process
-```javascript
+#### Example 3: Complex Response
+**Situation**: After analyzing a file
+**Action**:
+```json
 {
-  "type": "send",
-  "content": "Let me analyze this... First I'll check your previous requests...",
-  "messageType": "thinking"
+  "message": "I've analyzed the file. Here are the key findings:\n\n1. First point\n2. Second point\n3. Third point"
 }
 ```
 
-### Example 4: Error Message
-**Situation**: Something failed
-**Action**: Report error
-```javascript
-{
-  "type": "send",
-  "content": "I couldn't read that file. Error: Permission denied",
-  "messageType": "error"
-}
-```
+## CRITICAL RULES
 
-## Scripts
+1. **ALWAYS use "message" parameter directly**
+   - ✅ CORRECT: `{"message": "Hello"}`
+   - ❌ WRONG: `{"action": "send", "params": {"message": "Hello"}}`
+   - ❌ WRONG: `{"type": "send", "content": "Hello"}`
 
-### send
-- **Purpose**: Send message to user
-- **Usage**: Call with message JSON
-- **Returns**: Confirmation of send
+2. **NEVER nest the message**
+   - The message must be a direct string value
+   - NOT inside another object
 
-## Rules
-
-1. **ALWAYS use this skill** - No exceptions
-2. **Be clear and concise** - Users appreciate clarity
-3. **Match tone to context** - Professional but warm
-4. **Include relevant info** - Don't make user ask twice
+3. **ALWAYS include message content**
+   - Empty messages are not allowed
+   - The message must be a non-empty string
 
 ## Common Mistakes
 
-❌ **Don't**: Output without using cli-bridge
-✅ **Do**: Always call this skill
+❌ **Don't**: 
+```json
+{
+  "action": "response",
+  "params": "{\"message\": \"Hello\"}"
+}
+```
+
+✅ **Do**:
+```json
+{
+  "message": "Hello"
+}
+```
+
+❌ **Don't**: Output text without calling cli-bridge
+✅ **Do**: Always call cli-bridge tool with message parameter
 
 ❌ **Don't**: Send empty messages
-✅ **Do**: Always have content
+✅ **Do**: Always have meaningful content
 
-❌ **Don't**: Use wrong message type
-✅ **Do**: Match type to content
-
-## Implementation Note
+## Implementation
 
 This skill interfaces with the MCP CLI server to display output in the user's terminal.
 
 ---
 
-**Remember**: Every. Single. Response. Must. Use. This.
+**Remember**: Every. Single. Response. Must. Use. Cli-bridge with direct message parameter.
