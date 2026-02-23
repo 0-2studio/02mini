@@ -37,10 +37,10 @@ export class MCPClient extends EventEmitter {
         env: { ...process.env, ...(this.config.env || {}) } as Record<string, string>,
       });
 
-      // Connect with timeout
+      // Connect with timeout (30 seconds)
       const connectPromise = this.client.connect(this.transport);
       const timeoutPromise = new Promise((_, reject) => {
-        setTimeout(() => reject(new Error('Connection timeout')), 10000);
+        setTimeout(() => reject(new Error('Connection timeout')), 30000);
       });
 
       await Promise.race([connectPromise, timeoutPromise]);

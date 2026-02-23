@@ -68,6 +68,7 @@ bun run build
 - `/read <file>` - 读取文件
 - `/context` - 显示上下文窗口状态
 - `/compact` - 手动压缩对话历史
+- `/qq` - QQ 机器人管理 (NapCat)
 - `/exit` - 退出
 
 ## 技能系统
@@ -259,3 +260,49 @@ AI 会在以下情况主动发消息：
 ### 静默期
 
 用户发送消息后，会有 1 分钟的静默期，期间不会发送主动消息。
+
+## QQ 机器人集成 (NapCat)
+
+02mini 可以通过 NapCat 接入 QQ，成为 QQ 机器人。
+
+### 快速开始
+
+1. **安装 NapCat**
+   - 下载：https://github.com/NapNeko/NapCatQQ/releases
+   - 登录 QQ 小号
+
+2. **配置 NapCat**
+   ```json
+   {
+     "network": {
+       "websocketClients": [{
+         "name": "02mini",
+         "enable": true,
+         "url": "ws://localhost:3002/onebot"
+       }]
+     }
+   }
+   ```
+
+3. **启用 QQ 模块**
+   ```
+   /qq enable
+   ```
+
+4. **设置权限**
+   ```
+   /qq allow group 123456789  # 允许特定群
+   /qq allow user 987654321   # 允许特定用户
+   ```
+
+### 特性
+
+- ✅ 私聊支持
+- ✅ 群聊支持 (@ 触发)
+- ✅ 权限管理 (白名单/黑名单)
+- ✅ AI 主动发消息
+- ✅ 长消息自动分段
+
+### 详细文档
+
+查看 [docs/QQ_SETUP.md](docs/QQ_SETUP.md) 获取完整教程。

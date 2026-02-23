@@ -5,6 +5,7 @@
 
 import type { FastifyInstance } from 'fastify';
 import type { GatewayContext } from '../types.js';
+import { stripMessageMarker } from '../../core/engine.js';
 import { randomUUID } from 'crypto';
 
 export function createChatRoutes(context: GatewayContext) {
@@ -47,7 +48,9 @@ export function createChatRoutes(context: GatewayContext) {
         }
 
         // Process through engine
-        const response = await context.engine.processUserInput(lastUserMessage.content);
+        const rawResponse = await context.engine.processUserInput(lastUserMessage.content);
+        // Strip message marker if present (prevents [MSG_ALREADY_SHOWN] from being sent)
+        const response = stripMessageMarker(rawResponse);
 
         // Build OpenAI-compatible response
         const completion = {
@@ -104,7 +107,9 @@ export function createChatRoutes(context: GatewayContext) {
         const sessionId = body.sessionId || randomUUID();
 
         // Process through engine
-        const response = await context.engine.processUserInput(body.message);
+        const rawResponse = await context.engine.processUserInput(body.message);
+        // Strip message marker if present
+        const response = stripMessageMarker(rawResponse);
 
         reply.send({
           success: true,

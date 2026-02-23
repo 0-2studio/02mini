@@ -7,10 +7,19 @@
 import { encodingForModel, type TiktokenModel } from 'js-tiktoken';
 import type { ChatMessage } from '../ai/client.js';
 
-// Token budget configuration
+// Token budget configuration - reads from environment variables
+function getEnvNumber(key: string, defaultValue: number): number {
+  const value = process.env[key];
+  if (value) {
+    const parsed = parseInt(value, 10);
+    return isNaN(parsed) ? defaultValue : parsed;
+  }
+  return defaultValue;
+}
+
 export const TOKEN_CONFIG = {
-  // Total context window size (adjust based on model)
-  maxContextTokens: 8000,
+  // Total context window size - from env or default 8k
+  maxContextTokens: getEnvNumber('AI_MAX_TOKENS', 8000),
   
   // Reserve tokens for system prompt
   systemPromptReserve: 2000,
@@ -23,19 +32,24 @@ export const TOKEN_CONFIG = {
     return this.maxContextTokens - this.systemPromptReserve - this.responseReserve;
   },
   
-  // Warning threshold (80% of max history)
-  get warningThreshold(): number {
-    return Math.floor(this.maxHistoryTokens * 0.8);
-  },
-  
-  // Critical threshold (95% of max history) - trigger aggressive compression
-  get criticalThreshold(): number {
-    return Math.floor(this.maxHistoryTokens * 0.95);
-  },
-  
-  // Target tokens after compression (50% of max history)
-  get targetTokensAfterCompression(): number {
+  // Light compression threshold (50% of max history) - start compression early
+  get lightThreshold(): number {
     return Math.floor(this.maxHistoryTokens * 0.5);
+  },
+
+  // Medium compression threshold (75% of max history) - use AI summarization
+  get mediumThreshold(): number {
+    return Math.floor(this.maxHistoryTokens * 0.75);
+  },
+
+  // Critical threshold (90% of max history) - aggressive compression
+  get criticalThreshold(): number {
+    return Math.floor(this.maxHistoryTokens * 0.9);
+  },
+  
+  // Target tokens after compression (60% of max history for better retention)
+  get targetTokensAfterCompression(): number {
+    return Math.floor(this.maxHistoryTokens * 0.6);
   },
 };
 
@@ -132,18 +146,20 @@ export function getTokenStatus(
   max: number;
   remaining: number;
   percentage: number;
-  status: 'ok' | 'warning' | 'critical';
+  status: 'ok' | 'light' | 'medium' | 'critical';
 } {
   const { total } = countConversationTokens(messages, model);
   const max = TOKEN_CONFIG.maxHistoryTokens;
   const remaining = max - total;
   const percentage = (total / max) * 100;
   
-  let status: 'ok' | 'warning' | 'critical' = 'ok';
+  let status: 'ok' | 'light' | 'medium' | 'critical' = 'ok';
   if (total >= TOKEN_CONFIG.criticalThreshold) {
     status = 'critical';
-  } else if (total >= TOKEN_CONFIG.warningThreshold) {
-    status = 'warning';
+  } else if (total >= TOKEN_CONFIG.mediumThreshold) {
+    status = 'medium';
+  } else if (total >= TOKEN_CONFIG.lightThreshold) {
+    status = 'light';
   }
   
   return {
@@ -177,18 +193,23 @@ export function formatTokenCount(count: number): string {
 
 /**
  * Check if compaction is needed
+ * New threshold strategy:
+ * - >90%: light compression (simple pruning)
+ * - >95%: medium compression (AI summarization)
+ * - >98%: heavy compression (aggressive + AI)
  */
 export function checkCompactionNeeded(
   messages: ChatMessage[],
   model: string = 'gpt-4'
 ): { needed: boolean; level: 'none' | 'light' | 'medium' | 'heavy'; stats: ReturnType<typeof getTokenStatus> } {
   const stats = getTokenStatus(messages, model);
+  const { total } = countConversationTokens(messages, model);
   
-  if (stats.status === 'critical') {
+  if (total >= TOKEN_CONFIG.criticalThreshold) {
     return { needed: true, level: 'heavy', stats };
-  } else if (stats.status === 'warning') {
+  } else if (total >= TOKEN_CONFIG.mediumThreshold) {
     return { needed: true, level: 'medium', stats };
-  } else if (stats.percentage > 60) {
+  } else if (total >= TOKEN_CONFIG.lightThreshold) {
     return { needed: true, level: 'light', stats };
   }
   

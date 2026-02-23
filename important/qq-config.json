@@ -1,0 +1,31 @@
+{
+  "config": {
+    "enabled": true,
+    "mode": "websocket-client",
+    "port": 3002,
+    "host": "0.0.0.0",
+    "autoFriendAccept": false,
+    "autoGroupInviteAccept": false,
+    "atRequiredInGroup": false,
+    "maxMessageLength": 2000,
+    "splitLongMessages": true,
+    "typingIndicator": false,
+    "accessToken": "~EdSd~~PpS99Z3fT",
+    "napcatWsUrl": "ws://localhost:8082"
+  },
+  "permissions": {
+    "allowedUsers": [],
+    "blockedUsers": [],
+    "allowAllPrivate": true,
+    "allowedGroups": [
+      1053824168,
+      852484265,
+      796386403,
+      1027431235,
+      570019302
+    ],
+    "blockedGroups": [],
+    "allowAllGroups": false,
+    "adminUsers": []
+  }
+}

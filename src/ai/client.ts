@@ -54,6 +54,8 @@ export interface ChatCompletionResponse {
     completion_tokens: number;
     total_tokens: number;
   };
+  status?: string;
+  msg?: string;
 }
 
 export class AIClient {
@@ -127,6 +129,15 @@ export class AIClient {
       const response = await fetch(`${this.config.baseURL}/chat/completions`, fetchOptions);
 
       if (!response.ok) {
+        // Check for rate limit error (status 449)
+        if (response.status === 449) {
+          console.log('[AI] Rate limit hit (status 449)');
+          return {
+            choices: [],
+            status: '449',
+            msg: 'You exceeded your current rate limit',
+          };
+        }
         const error = await response.text();
         throw new Error(`API error: ${response.status} - ${error}`);
       }

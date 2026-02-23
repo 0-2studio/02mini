@@ -4,12 +4,13 @@
  */
 
 import readline from 'readline';
-import { CoreEngine } from '../core/engine.js';
+import { CoreEngine, hasMessageMarker } from '../core/engine.js';
 import { MCPManager, mcpManager } from '../mcp/manager.js';
 import { SkillRegistry } from '../skills-impl/skill-registry.js';
 import { AIClient } from '../ai/client.js';
 import { CronScheduler } from '../cron/index.js';
 import type { ProactiveTrigger } from '../autonomous/types.js';
+import type { QQAdapter, QQConfigManager } from '../qq/index.js';
 import fs from 'fs/promises';
 import path from 'path';
 
@@ -63,6 +64,8 @@ export class CLIInterface {
   private skillRegistry: SkillRegistry;
   private workingDir: string;
   private cronScheduler: CronScheduler;
+  private qqAdapter: QQAdapter | null = null;
+  private qqConfigManager: QQConfigManager | null = null;
 
   // Callbacks for external integrations
   onEngineReady?: (engine: CoreEngine) => Promise<void> | void;
@@ -86,6 +89,25 @@ export class CLIInterface {
     
     // Print help hint
     console.log(dim('\n💡 Type "/help" for available commands\n'));
+
+    // Auto-trigger memory review at startup
+    console.log(c('🧠 Reviewing memories at startup...\n', 'brightYellow'));
+    
+    // CRITICAL: Pause QQ message processing during memory review
+    this.qqAdapter?.pause();
+    
+    const memoryReviewPrompt = `[Task: Review Memories]\n\n` +
+      `Please read the following memory files to understand context:\n` +
+      `1. memory/user-profile.md - User preferences and important details\n` +
+      `2. memory/daily-logs/ (most recent) - Recent activities\n` +
+      `3. memory/self-reflections/ (most recent) - Lessons learned\n` +
+      `4. memory/knowledge/ (relevant to upcoming tasks)\n\n` +
+      `After reading, provide a brief summary of key information.\n` +
+      `Use file-system tools to read these files, then reply "NO" when done.`;
+    await this.processInput(memoryReviewPrompt);
+    
+    // Resume QQ message processing after memory review
+    this.qqAdapter?.resume();
 
     // Start CLI
     this.rl = readline.createInterface({
@@ -146,7 +168,7 @@ export class CLIInterface {
 
           if (!abortController.signal.aborted) {
             // Skip display if response is marked as already shown (via cli-bridge)
-            if (response && !response.includes('[MSG_ALREADY_SHOWN]')) {
+            if (response && !hasMessageMarker(response)) {
               this.printResponse(response);
             }
           }
@@ -274,6 +296,31 @@ export class CLIInterface {
     console.log(c('✨ Ready for conversation!\n', 'brightGreen'));
   }
 
+  /**
+   * Process input through the engine (used for auto-triggered actions)
+   */
+  private async processInput(input: string): Promise<void> {
+    if (!this.engine) {
+      console.log(c('⚠️ Engine not initialized', 'brightRed'));
+      return;
+    }
+
+    this.showThinking();
+
+    try {
+      const response = await this.engine.processUserInput(input);
+      this.hideThinking();
+
+      // Skip display if response is marked as already shown (via cli-bridge)
+      if (response && !hasMessageMarker(response)) {
+        this.printResponse(response);
+      }
+    } catch (error) {
+      this.hideThinking();
+      this.printError(error instanceof Error ? error.message : String(error));
+    }
+  }
+
   private async handleCommand(cmd: string): Promise<void> {
     const parts = cmd.split(' ');
     const command = parts[0].toLowerCase();
@@ -330,6 +377,10 @@ export class CLIInterface {
         await this.compactContext();
         break;
 
+      case '/qq':
+        await this.handleQQCommand(parts.slice(1));
+        break;
+
       default:
         this.printError(`Unknown command: ${command}`);
         console.log(dim('Type /help for available commands'));
@@ -345,6 +396,7 @@ export class CLIInterface {
     console.log(c('│', 'brightBlue') + '  /status    - Show system status         ' + c('│', 'brightBlue'));
     console.log(c('│', 'brightBlue') + '  /context   - Show context window status ' + c('│', 'brightBlue'));
     console.log(c('│', 'brightBlue') + '  /compact   - Compact conversation (opt) ' + c('│', 'brightBlue'));
+    console.log(c('│', 'brightBlue') + '  /qq        - QQ NapCat bot management   ' + c('│', 'brightBlue'));
     console.log(c('│', 'brightBlue') + '  /read      - Read a file                ' + c('│', 'brightBlue'));
     console.log(c('│', 'brightBlue') + '  /memory    - List memory files          ' + c('│', 'brightBlue'));
     console.log(c('│', 'brightBlue') + '  /reset     - Reset all AI data (DANGER) ' + c('│', 'brightBlue'));
@@ -583,6 +635,173 @@ export class CLIInterface {
     console.log(c('┌─ Compaction Result ─────────────────────┐', 'brightGreen'));
     console.log(c('│', 'brightGreen') + '  ' + c(result.slice(0, 37), 'brightWhite').padEnd(39) + c('│', 'brightGreen'));
     console.log(c('└─────────────────────────────────────────┘', 'brightGreen'));
+    console.log();
+  }
+
+  /**
+   * Set QQ adapter and config manager
+   */
+  setQQAdapter(adapter: QQAdapter, configManager: QQConfigManager): void {
+    this.qqAdapter = adapter;
+    this.qqConfigManager = configManager;
+  }
+
+  /**
+   * Handle QQ commands
+   */
+  private async handleQQCommand(args: string[]): Promise<void> {
+    if (!this.qqConfigManager) {
+      this.printError('QQ module not initialized');
+      console.log(dim('\nTo enable QQ:'));
+      console.log(dim('1. Set environment variables in .env file:'));
+      console.log(dim('   QQ_ENABLED=true'));
+      console.log(dim('   QQ_PORT=6099'));
+      console.log(dim('   QQ_TOKEN=your-token'));
+      console.log(dim('2. Or run: /qq enable'));
+      console.log(dim('3. Restart 02mini'));
+      return;
+    }
+
+    const subCommand = args[0];
+
+    switch (subCommand) {
+      case 'status':
+        await this.showQQStatus();
+        break;
+
+      case 'enable':
+        await this.qqConfigManager.enable();
+        console.log(c('✓ QQ adapter enabled. Restart 02 to apply.', 'brightGreen'));
+        break;
+
+      case 'disable':
+        await this.qqConfigManager.disable();
+        console.log(c('✓ QQ adapter disabled. Restart 02 to apply.', 'brightGreen'));
+        break;
+
+      case 'allow':
+        if (args[1] === 'user' && args[2]) {
+          const userId = parseInt(args[2]);
+          await this.qqConfigManager.allowUser(userId);
+          console.log(c(`✓ User ${userId} allowed`, 'brightGreen'));
+        } else if (args[1] === 'group' && args[2]) {
+          const groupId = parseInt(args[2]);
+          await this.qqConfigManager.allowGroup(groupId);
+          console.log(c(`✓ Group ${groupId} allowed`, 'brightGreen'));
+        } else {
+          this.printError('Usage: /qq allow user|group <id>');
+        }
+        break;
+
+      case 'block':
+        if (args[1] === 'user' && args[2]) {
+          const userId = parseInt(args[2]);
+          await this.qqConfigManager.blockUser(userId);
+          console.log(c(`✓ User ${userId} blocked`, 'brightGreen'));
+        } else if (args[1] === 'group' && args[2]) {
+          const groupId = parseInt(args[2]);
+          await this.qqConfigManager.blockGroup(groupId);
+          console.log(c(`✓ Group ${groupId} blocked`, 'brightGreen'));
+        } else {
+          this.printError('Usage: /qq block user|group <id>');
+        }
+        break;
+
+      case 'list':
+        await this.listQQPermissions();
+        break;
+
+      case 'admin':
+        if (args[2] === 'add' && args[3]) {
+          const userId = parseInt(args[3]);
+          await this.qqConfigManager.addAdmin(userId);
+          console.log(c(`✓ User ${userId} added as admin`, 'brightGreen'));
+        } else if (args[2] === 'remove' && args[3]) {
+          const userId = parseInt(args[3]);
+          await this.qqConfigManager.removeAdmin(userId);
+          console.log(c(`✓ User ${userId} removed from admin`, 'brightGreen'));
+        } else {
+          this.printError('Usage: /qq admin add|remove <user_id>');
+        }
+        break;
+
+      default:
+        this.printQQHelp();
+    }
+  }
+
+  /**
+   * Show QQ status
+   */
+  private async showQQStatus(): Promise<void> {
+    const config = this.qqConfigManager!.getConfig();
+    const status = this.qqAdapter?.getStatus() || { running: false, sessions: 0 };
+
+    console.log();
+    console.log(c('┌─ QQ Status ─────────────────────────────┐', 'brightCyan'));
+    console.log(c('│', 'brightCyan') + `  Enabled: ${config.enabled ? c('Yes', 'brightGreen') : c('No', 'brightRed')}`.padEnd(39) + c('│', 'brightCyan'));
+    console.log(c('│', 'brightCyan') + `  Running: ${status.running ? c('Yes', 'brightGreen') : c('No', 'brightRed')}`.padEnd(39) + c('│', 'brightCyan'));
+    console.log(c('│', 'brightCyan') + `  Active Sessions: ${status.sessions.toString().padEnd(24)}` + c('│', 'brightCyan'));
+    console.log(c('│', 'brightCyan') + `  Mode: ${(config.mode || 'websocket-server').padEnd(32)}` + c('│', 'brightCyan'));
+    console.log(c('│', 'brightCyan') + `  Port: ${(config.port || 3002).toString().padEnd(33)}` + c('│', 'brightCyan'));
+    console.log(c('│', 'brightCyan') + `  @ Required in Group: ${config.atRequiredInGroup ? 'Yes' : 'No'}`.padEnd(24) + c('│', 'brightCyan'));
+    console.log(c('└─────────────────────────────────────────┘', 'brightCyan'));
+    console.log();
+  }
+
+  /**
+   * List QQ permissions
+   */
+  private async listQQPermissions(): Promise<void> {
+    const perms = this.qqConfigManager!.getPermissionsSummary();
+
+    console.log();
+    console.log(c('┌─ QQ Permissions ────────────────────────┐', 'brightMagenta'));
+    console.log(c('│', 'brightMagenta') + '  Allowed Users:'.padEnd(39) + c('│', 'brightMagenta'));
+    if (perms.allowAllPrivate) {
+      console.log(c('│', 'brightMagenta') + `    ${c('(All users allowed)', 'dim')}`.padEnd(37) + c('│', 'brightMagenta'));
+    } else {
+      perms.allowedUsers.forEach(id => {
+        console.log(c('│', 'brightMagenta') + `    ${c('✓', 'brightGreen')} ${id.toString()}`.padEnd(34) + c('│', 'brightMagenta'));
+      });
+    }
+    console.log(c('│', 'brightMagenta') + '  Blocked Users:'.padEnd(39) + c('│', 'brightMagenta'));
+    perms.blockedUsers.forEach(id => {
+      console.log(c('│', 'brightMagenta') + `    ${c('✗', 'brightRed')} ${id.toString()}`.padEnd(34) + c('│', 'brightMagenta'));
+    });
+    console.log(c('│', 'brightMagenta') + '  Allowed Groups:'.padEnd(39) + c('│', 'brightMagenta'));
+    if (perms.allowAllGroups) {
+      console.log(c('│', 'brightMagenta') + `    ${c('(All groups allowed)', 'dim')}`.padEnd(37) + c('│', 'brightMagenta'));
+    } else {
+      perms.allowedGroups.forEach(id => {
+        console.log(c('│', 'brightMagenta') + `    ${c('✓', 'brightGreen')} ${id.toString()}`.padEnd(34) + c('│', 'brightMagenta'));
+      });
+    }
+    console.log(c('│', 'brightMagenta') + '  Admin Users:'.padEnd(39) + c('│', 'brightMagenta'));
+    perms.adminUsers.forEach(id => {
+      console.log(c('│', 'brightMagenta') + `    ${c('★', 'brightYellow')} ${id.toString()}`.padEnd(34) + c('│', 'brightMagenta'));
+    });
+    console.log(c('└─────────────────────────────────────────┘', 'brightMagenta'));
+    console.log();
+  }
+
+  /**
+   * Print QQ help
+   */
+  private printQQHelp(): void {
+    console.log();
+    console.log(c('┌─ QQ Commands ───────────────────────────┐', 'brightBlue'));
+    console.log(c('│', 'brightBlue') + '  /qq status              - Show QQ status'.padEnd(39) + c('│', 'brightBlue'));
+    console.log(c('│', 'brightBlue') + '  /qq enable              - Enable QQ adapter'.padEnd(39) + c('│', 'brightBlue'));
+    console.log(c('│', 'brightBlue') + '  /qq disable             - Disable QQ adapter'.padEnd(39) + c('│', 'brightBlue'));
+    console.log(c('│', 'brightBlue') + '  /qq allow user <id>     - Allow private chat'.padEnd(39) + c('│', 'brightBlue'));
+    console.log(c('│', 'brightBlue') + '  /qq allow group <id>    - Allow group access'.padEnd(39) + c('│', 'brightBlue'));
+    console.log(c('│', 'brightBlue') + '  /qq block user <id>     - Block private chat'.padEnd(39) + c('│', 'brightBlue'));
+    console.log(c('│', 'brightBlue') + '  /qq block group <id>    - Block group access'.padEnd(39) + c('│', 'brightBlue'));
+    console.log(c('│', 'brightBlue') + '  /qq list                - List permissions'.padEnd(39) + c('│', 'brightBlue'));
+    console.log(c('│', 'brightBlue') + '  /qq admin add <id>      - Add admin user'.padEnd(39) + c('│', 'brightBlue'));
+    console.log(c('│', 'brightBlue') + '  /qq admin remove <id>   - Remove admin user'.padEnd(39) + c('│', 'brightBlue'));
+    console.log(c('└─────────────────────────────────────────┘', 'brightBlue'));
     console.log();
   }
 

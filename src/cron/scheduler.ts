@@ -346,6 +346,11 @@ export class CronScheduler extends EventEmitter {
       updatedAt: now,
     };
 
+    // Auto-set deleteAfterRun for 'at' schedule (one-time tasks)
+    if (job.schedule.kind === 'at' && job.deleteAfterRun !== false) {
+      job.deleteAfterRun = true;
+    }
+
     // Compute initial next run
     const nextRun = this.computeNextRun(job.schedule);
     if (nextRun) {

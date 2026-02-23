@@ -7,6 +7,7 @@ import Fastify from 'fastify';
 import cors from '@fastify/cors';
 import websocket from '@fastify/websocket';
 import type { CoreEngine } from '../core/engine.js';
+import { stripMessageMarker } from '../core/engine.js';
 import type { CronScheduler } from '../cron/index.js';
 import type {
   GatewayConfig,
@@ -224,7 +225,9 @@ export class GatewayServer {
       case 'message':
         // Process message through engine
         try {
-          const response = await this.context.engine.processUserInput(message.content);
+          const rawResponse = await this.context.engine.processUserInput(message.content);
+          // Strip message marker if present (prevents [MSG_ALREADY_SHOWN] from being sent)
+          const response = stripMessageMarker(rawResponse);
           this.sendToSocket(socket, {
             type: 'response',
             content: response,

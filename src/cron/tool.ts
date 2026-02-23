@@ -32,8 +32,9 @@ ACTIONS:
 - resume: Re-enable a paused job
 
 SCHEDULE TYPES:
-1. "at": One-time execution at specific time
+1. "at": One-time execution at specific time (REQUIRES deleteAfterRun: true)
    Example: {"kind": "at", "at": "2026-02-22T15:30:00+08:00"}
+   IMPORTANT: Always set deleteAfterRun: true for one-time reminders!
    
 2. "every": Recurring interval in milliseconds
    Example: {"kind": "every", "everyMs": 60000}  // Every minute
@@ -91,12 +92,22 @@ EXAMPLES:
               wakeMode: { type: 'string', enum: ['next-heartbeat', 'now'], description: 'When to wake (default: now)' },
               payload: {
                 type: 'object',
-                description: 'What to do when job runs',
+                description: 'What to do when job runs. IMPORTANT: If setting a reminder for a QQ user, include qqContext with user_id or group_id so the reminder is sent back to QQ, not CLI!',
                 properties: {
                   kind: { type: 'string', enum: ['systemEvent', 'agentTurn'], description: 'Payload type' },
                   text: { type: 'string', description: 'Message text for systemEvent' },
                   message: { type: 'string', description: 'AI instruction for agentTurn' },
                   model: { type: 'string', description: 'Optional model override for agentTurn' },
+                  qqContext: {
+                    type: 'object',
+                    description: 'CRITICAL: Include this when the request came from QQ! Specifies where to send the response when the job triggers.',
+                    properties: {
+                      platform: { type: 'string', enum: ['qq'], description: 'Must be "qq" for QQ messages' },
+                      user_id: { type: 'number', description: 'QQ user ID for private messages (e.g., 123456789)' },
+                      group_id: { type: 'number', description: 'QQ group ID for group messages (e.g., 987654321)' },
+                      isGroup: { type: 'boolean', description: 'true if this is a group message' },
+                    },
+                  },
                 },
               },
             },

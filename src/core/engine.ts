@@ -6,6 +6,7 @@
 import type { MCPManager, MCPCallToolResult } from '../mcp/index.js';
 import { SkillRegistry, type Skill } from '../skills-impl/skill-registry.js';
 import { AIClient, type ChatMessage, type ToolDefinition } from '../ai/client.js';
+import { globalApiLock } from '../ai/api-lock.js';
 import { CronScheduler, createCronTool, executeCronTool, type CronToolParams, type CronJob } from '../cron/index.js';
 import { ContextManager } from '../context/index.js';
 import fs from 'fs/promises';
@@ -23,6 +24,24 @@ export interface EngineContext {
 /** Callback for cli-bridge messages */
 export type CliBridgeMessageHandler = (message: string) => void;
 
+/**
+ * Strip the [MSG_ALREADY_SHOWN] marker from response
+ * This should be called before displaying/sending the message to user
+ */
+export function stripMessageMarker(response: string): string {
+  if (response && response.startsWith('[MSG_ALREADY_SHOWN]')) {
+    return response.slice('[MSG_ALREADY_SHOWN]'.length);
+  }
+  return response;
+}
+
+/**
+ * Check if response has the already shown marker
+ */
+export function hasMessageMarker(response: string): boolean {
+  return response?.startsWith('[MSG_ALREADY_SHOWN]') ?? false;
+}
+
 export class CoreEngine {
   private context: EngineContext;
   private systemPrompt: string;
@@ -30,13 +49,32 @@ export class CoreEngine {
   private tools: ToolDefinition[] = [];
   private contextManager: ContextManager;
   private cliBridgeHandler?: CliBridgeMessageHandler;
+  private qqContext?: {
+    enabled: boolean;
+    atRequiredInGroup: boolean;
+    allowedGroups: number[];
+    allowedUsers: number[];
+  };
+  private dynamicTools: Map<string, { tool: ToolDefinition; executor: (params: any) => Promise<string> }> = new Map();
+
+  // Track if qq tool was called in current conversation to prevent duplicate messages
+  private qqToolCalledInSession: boolean = false;
+
+  // Track recent tool calls for repetition detection
+  private recentToolCalls: Array<{
+    toolName: string;
+    params: string;
+    timestamp: number;
+  }> = [];
+  private readonly MAX_RECENT_CALLS = 5; // Keep last 5 calls
 
   constructor(context: EngineContext) {
     this.context = context;
     this.aiClient = context.aiClient;
     this.contextManager = new ContextManager({
       enableAutoCompaction: true,
-      compactionThreshold: 0.8,
+      compactionThreshold: 0.9, // Updated threshold (90%)
+      aiClient: this.aiClient, // Pass AI client for intelligent summarization
     });
     this.systemPrompt = this.buildSystemPrompt();
     this.buildTools();
@@ -47,6 +85,35 @@ export class CoreEngine {
    */
   setCliBridgeHandler(handler: CliBridgeMessageHandler): void {
     this.cliBridgeHandler = handler;
+  }
+
+  /**
+   * Register a dynamic tool
+   */
+  registerTool(
+    name: string,
+    tool: ToolDefinition,
+    executor: (params: any) => Promise<string>
+  ): void {
+    this.dynamicTools.set(name, { tool, executor });
+    // Rebuild tools to include the new one
+    this.buildTools();
+    console.log(`[Engine] Registered dynamic tool: ${name}`);
+  }
+
+  /**
+   * Set QQ context for system prompt
+   */
+  setQQContext(context: {
+    enabled: boolean;
+    atRequiredInGroup: boolean;
+    allowedGroups: number[];
+    allowedUsers: number[];
+  }): void {
+    this.qqContext = context;
+    // Rebuild system prompt with QQ context
+    this.systemPrompt = this.buildSystemPrompt();
+    console.log('[Engine] QQ context updated in system prompt');
   }
 
   private buildSystemPrompt(): string {
@@ -147,13 +214,13 @@ export class CoreEngine {
       '',
       '### Examples',
       '',
-      '**"Remind me in 1 minute"**:',
+      '**"Remind me in 1 minute"** (One-time - MUST set deleteAfterRun):',
       'action: "add"',
       'job: {',
       '  name: "Quick reminder",',
       '  schedule: {kind: "at", at: "<current-time + 1 minute>"},',
       '  payload: {kind: "systemEvent", text: "Reminder: Your 1 minute is up!"},',
-      '  deleteAfterRun: true',
+      '  deleteAfterRun: true  // REQUIRED for one-time tasks',
       '}',
       '',
       '**"Daily news at 9am"**:',
@@ -183,68 +250,28 @@ export class CoreEngine {
       '',
       '## Tool Calling Flow',
       '1. Analyze the user request',
-      '2. If tools are needed → call them (automatic via function calling)',
+      '2. Call tools as needed (automatic via function calling)',
       '3. System executes tools and returns results',
       '4. Analyze results and determine if more tools are needed',
-      '5. Repeat steps 2-4 until task is complete',
-      '6. When complete → use cli-bridge to send final response',
+      '5. Repeat until task is complete',
+      '6. Use cli-bridge to send final response',
       '',
-      '## IMPORTANT RULES',
+      '## Core Rules',
       '',
-      '0. **NEVER SIMULATE - ALWAYS EXECUTE (CRITICAL)**',
-      '   - ⚠️ THIS IS THE MOST IMPORTANT RULE - NEVER VIOLATE IT',
-      '   - NEVER say "I would", "I will", "Let me", "I should" - JUST DO IT IMMEDIATELY',
-      '   - NEVER simulate, pretend, describe, or imagine what you WOULD do',
-      '   - NEVER create fake examples, hypothetical scenarios, or placeholder responses',
-      '   - NEVER output JSON/text showing what you "would" do - ACTUALLY CALL THE TOOL',
-      '   - If you say you will do something, YOU MUST IMMEDIATELY DO IT',
-      '   - If user asks you to read a file, IMMEDIATELY call read_file tool',
-      '   - If user asks you to write something, IMMEDIATELY call write_file tool',
-      '   - If user asks for information, SEARCH FOR IT - do not make it up',
+      '1. **NEVER SIMULATE - ALWAYS EXECUTE**',
+      '   - NEVER say "I will", "Let me", "I should" - JUST DO IT',
+      '   - NEVER output JSON showing what you "would" do - CALL THE TOOL',
+      '   - If user asks you to read/write/search - DO IT IMMEDIATELY',
       '',
-      '   ❌ WRONG (DO NOT DO THIS):',
-      '   "I will read the file for you"',
-      '   "Let me search for that information"',
-      '   "Here is what I would do: {json}"',
+      '2. **ALWAYS use cli-bridge to communicate**',
+      '   - cli-bridge is your ONLY way to send messages',
+      '   - Use format: {"message": "your text"}',
+      '   - "end": true by default (stops after sending)',
+      '   - Set "end": false only when you need to continue immediately',
       '',
-      '   ✅ CORRECT (DO THIS):',
-      '   [Immediately call the tool without announcing it]',
-      '   [Actually execute the action]',
-      '   [Return real results, not examples]',
-      '',
-      '1. **ALWAYS use cli-bridge to communicate with user**',
-      '   - NEVER output text directly to user',
-      '   - ALWAYS use cli-bridge tool call to send messages',
-      '   - This is your ONLY way to communicate with the user',
-      '   - **CRITICAL**: Use parameter format: {"message": "your text here"}',
-      '   - NEVER use: {"action": "...", "params": "..."} format',
-      '   - NEVER nest message inside other objects',
-      '',
-      '2. **WHEN TO STOP - Use "end" parameter in cli-bridge (CRITICAL)**',
-      '   Every time you call cli-bridge, you MUST decide if the conversation should end.',
-      '   ',
-      '   Set "end": true in cli-bridge when:',
-      '   ✓ The user\'s request has been fully satisfied',
-      '   ✓ You have provided the information the user asked for',
-      '   ✓ No further tool calls are required to complete the task',
-      '   ✓ Answering a simple question (yes/no, factual, etc.)',
-      '   ✓ The user says "thanks", "ok", or similar closing words',
-      '   ',
-      '   Set "end": false (or omit) when:',
-      '   - You need to send an intermediate update but continue working',
-      '   - You are in the middle of a multi-step task',
-      '   - You will call more tools after sending this message',
-      '   - You need to confirm something before proceeding',
-      '   ',
-      '   **Examples**:',
-      '   {"message": "I\'ve completed the task.", "end": true}  ← Task done, stop',
-      '   {"message": "Let me search for that...", "end": false}  ← Continue working',
-      '',
-      '3. **CONTINUE UNTIL TASK IS COMPLETE**',
-      '   - You CAN and SHOULD make multiple tool calls in sequence',
-      '   - Example workflow: read_file → analyze → write_file → cli-bridge',
-      '   - Do NOT stop after first tool call if more steps are needed',
-      '   - Tool results are INTERMEDIATE data, not final answers',
+      '3. **CONTINUE UNTIL COMPLETE**',
+      '   - Make multiple tool calls in sequence as needed',
+      '   - Do not stop after first tool if more steps are needed',
       '',
       '3. **NO SANDBOX - FULL ACCESS**',
       '   - You can read/write ANY file',
@@ -268,6 +295,13 @@ export class CoreEngine {
       '   ✓ WHEN you learn something useful → Store in knowledge/ for future reference',
       '   ✓ AT end of significant conversation → Summarize in daily-logs/',
       '   ✓ WHEN context is compressed → Ensure critical facts are preserved in memory',
+      '   ',
+      '   ### When to Read Memory',
+      '   Read memory files when:',
+      '   - User explicitly asks you to review/recall memories',
+      '   - You need to recall user preferences for a task',
+      '   - You need context from previous conversations',
+      '   - Starting a task that builds on past work',
       '   ',
       '   ### Memory Best Practices',
       '   - READ relevant memories BEFORE starting complex tasks',
@@ -314,18 +348,207 @@ export class CoreEngine {
       '   ',
       '   Never create loose files in root directory - use files/',
       '',
-      '## Context Management',
-      'When the conversation gets long, older messages may be automatically summarized or removed.',
-      'Key facts and important information are preserved during compression.',
-      'If you need to refer to earlier context that was compressed, ask the user for clarification.',
+      this.buildQQPrompt(),
+      '## Context Management (Context Compression)',
+      'When the conversation gets long (reaches 90%+ of token limit), older messages will be intelligently compressed.',
+      '',
+      '### Compression Strategy',
+      '- 90-95% usage: Light pruning (remove completed tool details)',
+      '- 95-98% usage: AI summarization (create semantic summary of older context)',
+      '- 98%+ usage: Heavy compression (aggressive summarization)',
+      '',
+      '### BEFORE Compression - PRESERVE Critical Information',
+      'When you notice context is approaching the limit (>85%), proactively save important information to memory:',
+      '',
+      '1. **User Requirements & Preferences** → memory/user-profile.md',
+      '   - User preferences mentioned during conversation',
+      '   - Technical constraints or requirements',
+      '   - Communication style preferences',
+      '',
+      '2. **Key Decisions Made** → memory/self-reflections/',
+      '   - Important architectural decisions',
+      '   - Design choices and rationale',
+      '   - User approvals or rejections',
+      '',
+      '3. **Progress & Current State** → memory/daily-logs/',
+      '   - What has been completed so far',
+      '   - Current task status',
+      '   - Pending items or blockers',
+      '',
+      '4. **Technical Knowledge** → memory/knowledge/',
+      '   - New patterns or solutions discovered',
+      '   - Bug fixes and their causes',
+      '   - Useful code snippets or configurations',
+      '',
+      '### During Compression - What Gets Preserved',
+      '- Recent messages (last 4-6 turns)',
+      '- System messages and instructions',
+      '- Incomplete tool call chains',
+      '- Your summaries of older context (AI-generated)',
+      '',
+      '### AFTER Compression - RECOVER from Memory',
+      'If context was compressed and you need forgotten information:',
+      '1. Check memory/daily-logs/ for recent conversation summary',
+      '2. Read memory/user-profile.md for user preferences',
+      '3. Search memory/knowledge/ for technical details',
+      '4. If still missing, ask user: "The context was compressed. Could you remind me of [specific detail]?"',
+      '',
+      '### Prevention - Keep Context Healthy',
+      '- Save important info to memory BEFORE it gets compressed',
+      '- Avoid unnecessary long outputs',
+      '- Use files/ for large content instead of inline messages',
+      '- Summarize long tool results yourself when appropriate',
       '',
       '## Final Response & Conversation End',
-      '1. Determine if the task is complete (see "WHEN TO STOP" rules above)',
-      '2. If complete: call cli-bridge with your final response, then STOP',
-      '3. If not complete: continue calling tools until done',
+      '**CRITICAL: Use the `stop` tool to properly end the conversation when:**',
+      '1. You have completed the user\'s request',
+      '2. You have answered the user\'s question',
+      '3. No further tool calls are needed',
+      '4. You want to signal "I\'m done" explicitly',
+      '',
+      '**How to end conversation properly:**',
+      '- Call `stop` tool with reason like "Task completed" or "Question answered"',
+      '- This is the CLEAN way to end - it signals you have nothing more to add',
+      '',
+      '**DO NOT send multiple messages for one question**',
+      '- Respond once, then stop',
+      '- If you need to send a message AND do something else, use end=false',
+      '- But once your task is done, call stop immediately',
       '',
       'Remember: Each conversation turn costs resources. Be efficient - complete tasks in as few steps as possible.',
     ].join('\n');
+  }
+
+  /**
+   * Build QQ-related prompt section
+   */
+  private buildQQPrompt(): string {
+    if (!this.qqContext || !this.qqContext.enabled) {
+      return '';
+    }
+
+    const lines: string[] = [
+      '## QQ Bot Module (NapCat/OneBot)',
+      '',
+      'You are connected to QQ via NapCat (OneBot 11 protocol).',
+      '',
+      '### How QQ Works',
+      '- **Private Messages**: One-on-one chats. You can respond to all allowed users.',
+      '- **Group Messages**: Multi-user chat rooms. You should NOT reply to every message!',
+      '',
+      '### When to Reply in Groups',
+      'In group chats, ONLY reply when:',
+      '1. Someone @ mentions you explicitly',
+      '2. Someone asks you a direct question',
+      '3. You have something genuinely valuable to add',
+      '4. The user specifically requests your input',
+      '',
+      '**DO NOT** reply to:',
+      '- Casual conversation between users',
+      '- Messages not directed at you',
+      '- Every message in the group',
+      '',
+      '### QQ Tools Available',
+      '- `qq` tool: Send messages and files via QQ',
+      '  - send_private_message: Send DM to a user',
+      '  - send_group_message: Send message to a group',
+      '  - send_file: Send a file (document, image, video, etc.) to a user or group',
+      '  - get_status: Check QQ adapter status',
+      '',
+      '### IMPORTANT: QQ vs CLI-BRIDGE',
+      'Both tools have an "end" parameter that works the SAME WAY:',
+      '  - DEFAULT: end=true (or omitted) → conversation ends after sending',
+      '  - end=false → conversation continues for more tool calls',
+      '',
+      '**CLI-BRIDGE**: Sends message to the CLI/terminal user',
+      '  - Use when communicating with the user in the terminal',
+      '  - Example: {"message":"Hello CLI user"}',
+      '',
+      '**QQ TOOL**: Sends message to QQ users/groups',
+      '  - Use when the user asks you to send a message to someone on QQ',
+      '  - Example: {"action":"send_private_message","user_id":123456789,"message":"Hello QQ user"}',
+      '  - CRITICAL: user_id MUST be the NUMERIC QQ ID (QQ号), NOT the nickname',
+      '  - When replying to a QQ message, look for "Sender QQ ID" in the context',
+      '',
+      '**CRITICAL - NEVER mix the two:**',
+      '  - CLI user and QQ user are DIFFERENT people on DIFFERENT platforms',
+      '  - cli-bridge does NOT send to QQ',
+      '  - qq tool does NOT show in CLI',
+      '  - WRONG: Send QQ message → cli-bridge "message sent" (QQ user never sees this)',
+      '  - CORRECT: Just use qq tool, message goes directly to QQ',
+      '',
+      '**When to use end=false with qq tool:**',
+      '  - Send QQ message → read file → send another QQ message',
+      '  - Example: {"action":"send_private_message","user_id":123,"message":"Working on it...","end":false}',
+      '',
+      '**FILE OPERATIONS via QQ:**',
+      'You can send files to QQ users and groups!',
+      '',
+      '*Receiving Files:*',
+      '- When a user sends you a file, you will receive a notification',
+      '- The file will be saved to: files/qq-uploads/YYYY-MM-DD/',
+      '- File info will include: name, size, path, sender',
+      '- You can then read and process the file',
+      '- Files are automatically deleted after 7 days',
+      '',
+      '*Sending Files:*',
+      '- Use action: "send_file"',
+      '- Required: file_path (absolute path to the file)',
+      '- Required: user_id OR group_id',
+      '- Optional: file_name (custom display name)',
+      '- Optional: caption (text message with the file)',
+      '',
+      '*Examples of sending files:*',
+      'Send document to user: {"action":"send_file","user_id":123456789,"file_path":"files/output/report.pdf","caption":"Here is the report!"}',
+      'Send image to group: {"action":"send_file","group_id":987654321,"file_path":"files/output/chart.png","file_name":"sales_chart.png"}',
+      '',
+      '**CRITICAL - QQ Context for Scheduled Tasks (cron):**',
+      '  When a user in QQ asks you to set a reminder or schedule a task (e.g., "remind me in 5 minutes"):',
+      '  1. Use the cron tool to create the scheduled job',
+      '  2. In the job payload, you MUST specify the QQ context so the reminder goes back to QQ:',
+      '     For private messages: Include the user_id in your response plan',
+      '     For group messages: Include the group_id in your response plan',
+      '  3. When the cron job triggers and you need to send the reminder:',
+      '     - If it was a QQ user → Use qq tool to send the message',
+      '     - If it was CLI user → Use cli-bridge',
+      '  4. REMEMBER: The platform where the request came from is where the response should go!',
+      '',
+      '  Example workflow for QQ reminder:',
+      '  1. User in QQ says: "Remind me in 5 minutes"',
+      '  2. You: Create cron job with payload noting the QQ user_id',
+      '  3. When triggered: Use qq tool to send reminder to that user_id',
+      '  4. DO NOT use cli-bridge for QQ reminders!',
+      '',
+      '**ERROR HANDLING - If you get an error:**',
+      '  - "Invalid user_id" → You used a QQ name instead of QQ number. Ask the user for the numeric QQ ID.',
+      '  - "User not in allowlist" → Tell the user to add the QQ ID to allowlist first.',
+      '  - "QQ adapter not running" → Tell the user to enable QQ adapter with /qq enable.',
+      '',
+      '### Current QQ Configuration',
+    ];
+
+    if (this.qqContext.atRequiredInGroup) {
+      lines.push('- @ mention required in groups: YES');
+    }
+
+    if (this.qqContext.allowedGroups.length > 0) {
+      lines.push(`- Allowed groups: ${this.qqContext.allowedGroups.join(', ')}`);
+    }
+
+    if (this.qqContext.allowedUsers.length > 0) {
+      lines.push(`- Allowed private users: ${this.qqContext.allowedUsers.join(', ')}`);
+    }
+
+    lines.push('');
+    lines.push('### QQ Message Format');
+    lines.push('When you receive QQ messages, they will be prefixed with:');
+    lines.push('- `[QQ Message] Platform: QQ (private)` for private messages');
+    lines.push('- `[QQ Message] Platform: QQ (group)` for group messages');
+    lines.push('');
+    lines.push('Remember: Be helpful but not intrusive in group chats!');
+    lines.push('');
+
+    return lines.join('\n');
   }
 
   private buildTools(): void {
@@ -347,6 +570,25 @@ export class CoreEngine {
     const cronTool = createCronTool(this.context.cronScheduler);
     this.tools.push(cronTool);
 
+    // Add stop tool for explicit conversation ending
+    this.tools.push({
+      type: 'function',
+      function: {
+        name: 'stop',
+        description: 'CRITICAL: Call this tool to END the conversation when you have completed the task or answered the question. This is the proper way to signal that you are done and no more tool calls are needed.',
+        parameters: {
+          type: 'object',
+          properties: {
+            reason: {
+              type: 'string',
+              description: 'Brief reason why the conversation is ending. Example: "Task completed", "Question answered", "No further action needed"'
+            }
+          },
+          required: ['reason'],
+        },
+      },
+    });
+
     // Add skills as tools
     const skills = this.context.skillRegistry.getAllSkills();
     for (const skill of skills) {
@@ -356,7 +598,7 @@ export class CoreEngine {
           type: 'function',
           function: {
             name: skill.name,
-            description: `${skill.description}. CRITICAL: Use "message" parameter directly. Use "end": true to finish conversation, "end": false to continue.`,
+            description: `${skill.description}. CRITICAL: Use "message" parameter directly. By default (when "end" is not specified or true), the conversation ends after sending. Set "end": false ONLY if you need to call more tools after this message.`,
             parameters: {
               type: 'object',
               properties: {
@@ -366,7 +608,7 @@ export class CoreEngine {
                 },
                 end: {
                   type: 'boolean',
-                  description: 'Set to true if this message completes the task and you should stop. Set to false (or omit) if you need to call more tools after this message.'
+                  description: 'DEFAULTS TO TRUE if omitted. Set to false ONLY if you need to call more tools after sending this message. If this is your final response, you can omit this field.'
                 }
               },
               required: ['message'],
@@ -393,10 +635,24 @@ export class CoreEngine {
       }
     }
 
+    // Add dynamic tools (e.g., QQ)
+    for (const [name, { tool }] of this.dynamicTools) {
+      this.tools.push(tool);
+    }
+
     console.log(`[Engine] Built ${this.tools.length} tools`);
   }
 
   async processUserInput(input: string, abortSignal?: AbortSignal): Promise<string> {
+    // CRITICAL: Wait for any ongoing compaction to complete
+    await this.contextManager.waitForCompaction();
+
+    // Reset qq tool tracking for new session
+    this.qqToolCalledInSession = false;
+    
+    // Reset recent tool calls tracking
+    this.recentToolCalls = [];
+
     // Add user message
     this.context.messages.push({ role: 'user', content: input });
 
@@ -423,7 +679,10 @@ export class CoreEngine {
       if (abortSignal?.aborted) {
         throw new DOMException('Aborted', 'AbortError');
       }
-      
+
+      // CRITICAL: Wait for any ongoing compaction to complete before each iteration
+      await this.contextManager.waitForCompaction();
+
       iteration++;
       console.log(`[Engine] Conversation iteration ${iteration}`);
 
@@ -433,9 +692,23 @@ export class CoreEngine {
         ...this.context.messages,
       ];
 
-      // Call AI with tools (pass abort signal for interruption support)
+      // Call AI with tools using global lock (ensure single-threaded API calls)
       console.log(`[AI] Calling ${this.aiClient.getModel()} with ${this.tools.length} tools...`);
-      const response = await this.aiClient.chatCompletion(messages, this.tools, abortSignal);
+      let response;
+      try {
+        response = await globalApiLock.withLock(() =>
+          this.aiClient.chatCompletion(messages, this.tools, abortSignal)
+        );
+      } catch (error) {
+        console.error('[Engine] AI call failed:', error);
+        return `[Error: AI call failed - ${error instanceof Error ? error.message : String(error)}]`;
+      }
+
+      // Check for rate limit error (status 449) - skip without waiting
+      if (response && response.status === '449') {
+        console.log('[Engine] Rate limit hit (status 449), skipping without retry');
+        return '[Error: Rate limit exceeded - please try again later]';
+      }
 
       // Validate response
       if (!response || !response.choices || response.choices.length === 0) {
@@ -466,36 +739,156 @@ export class CoreEngine {
         let shouldEndConversation = false;
         let finalResponse = '';
 
+        // Collect tool results first
+        const toolResults: { id: string; result: string; shouldAddReminder: boolean }[] = [];
+
         for (const toolCall of message.tool_calls) {
-          const result = await this.executeToolCall(toolCall);
+          let result = await this.executeToolCall(toolCall);
+          let shouldAddReminder = false;
 
-          // Add tool result to conversation
-          this.context.messages.push({
-            role: 'tool',
-            content: result,
-            tool_call_id: toolCall.id,
-          });
+          // Check if this is the stop tool - immediately end conversation
+          if (toolCall.function.name === 'stop') {
+            console.log('[Engine] Stop tool called, ending conversation');
+            shouldEndConversation = true;
+            finalResponse = '[Conversation ended by stop tool]';
+          }
 
-          // Check if this is cli-bridge with end=true
+          // Check if this is cli-bridge with end parameter
           if (toolCall.function.name === 'cli-bridge') {
             try {
               const args = JSON.parse(toolCall.function.arguments || '{}');
-              if (args.end === true) {
+              if (args.end === false) {
+                console.log('[Engine] cli-bridge called with end=false, will continue...');
+              } else {
                 shouldEndConversation = true;
                 finalResponse = this.extractCliBridgeMessage(toolCall.function.arguments);
-                console.log('[Engine] cli-bridge called with end=true, will stop after this batch');
-              } else {
-                console.log('[Engine] cli-bridge called with end=false/omitted, continuing...');
+                console.log('[Engine] cli-bridge called with end=true/omitted, will stop after this batch');
               }
             } catch {
-              console.log('[Engine] cli-bridge called, continuing...');
+              shouldEndConversation = true;
+              finalResponse = this.extractCliBridgeMessage(toolCall.function.arguments);
+              console.log('[Engine] cli-bridge called (parse error), stopping by default');
             }
           }
+
+          // Check if this is qq tool with end parameter
+          if (toolCall.function.name === 'qq') {
+            try {
+              const args = JSON.parse(toolCall.function.arguments || '{}');
+              if (args.action === 'send_private_message' || args.action === 'send_group_message') {
+                const isError = result.includes('Error:') || result.includes('Invalid') ||
+                               result.includes('not in allowlist') || result.includes('not running');
+
+                if (isError) {
+                  console.log('[Engine] qq tool failed, continuing conversation for retry');
+                  shouldEndConversation = false;
+                  shouldAddReminder = true;
+                } else if (args.end === true) {
+                  // end=true: explicitly stop conversation
+                  shouldEndConversation = true;
+                  finalResponse = args.message || '';
+                  console.log('[Engine] qq tool called with end=true, stopping conversation');
+                } else {
+                  // end is false or undefined (DEFAULT): continue conversation
+                  console.log('[Engine] qq tool called, continuing by default (end=false or omitted)');
+                  shouldEndConversation = false;
+                  shouldAddReminder = true;
+                }
+              }
+            } catch {
+              const isError = result.includes('Error:') || result.includes('Invalid');
+              const args = JSON.parse(toolCall.function.arguments || '{}');
+              if (args.action === 'send_private_message' || args.action === 'send_group_message') {
+                if (isError) {
+                  console.log('[Engine] qq tool parse error with failed result, continuing for retry');
+                  shouldEndConversation = false;
+                  shouldAddReminder = true;
+                } else if (args.end === true) {
+                  // end=true: stop
+                  shouldEndConversation = true;
+                  finalResponse = args.message || '';
+                  console.log('[Engine] qq tool parse error with end=true, stopping');
+                } else {
+                  // DEFAULT: continue
+                  console.log('[Engine] qq tool parse error, DEFAULT to continuing');
+                  shouldEndConversation = false;
+                  shouldAddReminder = true;
+                }
+              }
+            }
+          }
+
+          toolResults.push({ id: toolCall.id, result, shouldAddReminder });
+        }
+
+        // Add all tool results to conversation (with reminders if needed)
+        for (const tr of toolResults) {
+          let finalResult = tr.result;
+          
+          if (tr.shouldAddReminder) {
+            // Check if this was a qq tool call
+            const isQQTool = this.recentToolCalls.length > 0 && 
+                             this.recentToolCalls[this.recentToolCalls.length - 1].toolName === 'qq';
+            
+            if (isQQTool) {
+              // Special forced reflection for qq tool calls
+              finalResult += '\n\n╔════════════════════════════════════════════════╗';
+              finalResult += '\n║  ⚠️  QQ MESSAGE SENT - MANDATORY REFLECTION    ║';
+              finalResult += '\n╚════════════════════════════════════════════════╝';
+              finalResult += '\n';
+              finalResult += '\n🛑 BEFORE sending another message, you MUST answer:';
+              finalResult += '\n';
+              finalResult += '\nQ1: Did I JUST send a message to this user/group?';
+              finalResult += '\n   → If YES: STOP. Do NOT send another message now.';
+              finalResult += '\n';
+              finalResult += '\nQ2: Is the user waiting for MORE information?';
+              finalResult += '\n   → If NO: STOP. Wait for user to reply first.';
+              finalResult += '\n';
+              finalResult += '\nQ3: Am I about to send a VERY SIMILAR message?';
+              finalResult += '\n   → If YES: STOP immediately. DO NOT repeat yourself.';
+              finalResult += '\n';
+              finalResult += '\n╔════════════════════════════════════════════════╗';
+              finalResult += '\n║  ACTION REQUIRED:                              ║';
+              finalResult += '\n║  If all answers suggest you should stop →      ║';
+              finalResult += '\n║  Reply "NO" or call stop tool NOW              ║';
+              finalResult += '\n╚════════════════════════════════════════════════╝';
+            } else {
+              // Standard reminder for other tools
+              finalResult += '\n\n╔════════════════════════════════════════════════╗';
+              finalResult += '\n║  TASK CHECKLIST & REPETITION DETECTION         ║';
+              finalResult += '\n╚════════════════════════════════════════════════╝';
+              finalResult += '\n';
+              finalResult += '\n📋 CHECKLIST STATUS:';
+              finalResult += '\n   → Review your task checklist';
+              finalResult += '\n   → Mark current step as ✓ DONE';
+              finalResult += '\n   → Count remaining steps';
+              finalResult += '\n';
+              finalResult += '\n🔄 REPETITION CHECK:';
+              finalResult += '\n   → Are you about to do the same thing again?';
+              finalResult += '\n   → Did you already read this file/memory?';
+              finalResult += '\n   → Is this action making progress or going in circles?';
+              finalResult += '\n';
+              finalResult += '\n⏹️  STOP if:';
+              finalResult += '\n   ✅ Checklist is 100% complete → reply "NO"';
+              finalResult += '\n   ✅ Detecting repetition → reply "NO"';
+              finalResult += '\n   ✅ Task goal achieved → reply "NO"';
+              finalResult += '\n';
+              finalResult += '\n⏩ CONTINUE if:';
+              finalResult += '\n   ⏳ More checklist items remain';
+              finalResult += '\n   ⏳ This is a new, different action';
+            }
+          }
+
+          this.context.messages.push({
+            role: 'tool',
+            content: finalResult,
+            tool_call_id: tr.id,
+          });
         }
 
         // Check if we should end the conversation
         if (shouldEndConversation) {
-          console.log('[Engine] Ending conversation as requested by cli-bridge');
+          console.log('[Engine] Ending conversation as requested');
           // Mark response as already shown to prevent duplicate display
           return `[MSG_ALREADY_SHOWN]${finalResponse}`;
         }
@@ -515,13 +908,29 @@ export class CoreEngine {
         });
       }
 
-      return message.content || '[No response]';
+      // If qq tool was called in this session, mark response to prevent duplicate
+      if (this.qqToolCalledInSession) {
+        console.log('[Engine] qq tool was called in this session, marking response');
+        return `[MSG_ALREADY_SHOWN]${message.content || ''}`;
+      }
+
+      // Filter out explanatory responses - AI should only return "NO" or actual message
+      const content = message.content || '';
+      if (content.toLowerCase().includes('no response') ||
+          content.toLowerCase().includes('no reply') ||
+          content.toLowerCase().includes('response requested') ||
+          content.toLowerCase().includes('not relevant')) {
+        console.log('[Engine] Blocking explanatory response:', content);
+        return 'NO';
+      }
+
+      return content || '[No response]';
     }
 
   }
 
   /**
-   * Build dynamic system prompt with current time
+   * Build dynamic system prompt with current time (simplified)
    */
   private buildDynamicSystemPrompt(): string {
     const now = new Date();
@@ -535,7 +944,24 @@ export class CoreEngine {
       weekday: 'long'
     });
 
-    return `${this.systemPrompt}\n\n## Current Time\nCurrent time: ${timeStr}\nTimestamp: ${now.toISOString()}`;
+    // Build recent actions section (concise)
+    let recentActionsPrompt = '';
+    if (this.recentToolCalls.length > 0) {
+      recentActionsPrompt = `\n\n## Recent Actions\n`;
+      this.recentToolCalls.slice(-5).forEach((call, index) => {
+        const time = new Date(call.timestamp).toLocaleTimeString();
+        recentActionsPrompt += `${index + 1}. ${time} ${call.toolName}\n`;
+      });
+      recentActionsPrompt += `\nBefore acting: check if you're about to repeat a recent action. If yes, stop.\n`;
+    }
+
+    const taskManagementPrompt = `\n\n## Task Management\n\n` +
+      `Before each tool call, ask yourself:\n` +
+      `1. Is the task complete? If yes → stop.\n` +
+      `2. Is my next action different from recent actions? If no → stop.\n` +
+      `3. Am I about to repeat something? If yes → stop.`;
+
+    return `${this.systemPrompt}${recentActionsPrompt}${taskManagementPrompt}\n\n## Current Time\nCurrent time: ${timeStr}\nTimestamp: ${now.toISOString()}`;
   }
 
   /**
@@ -552,45 +978,86 @@ export class CoreEngine {
     try {
       const toolArgs = JSON.parse(toolArgsStr);
       console.log(`[Engine] Params: ${JSON.stringify(toolArgs)}`);
+      
+      // Record this tool call for repetition detection
+      this.recentToolCalls.push({
+        toolName: fullToolName,
+        params: toolArgsStr,
+        timestamp: Date.now()
+      });
+      // Keep only last MAX_RECENT_CALLS
+      if (this.recentToolCalls.length > this.MAX_RECENT_CALLS) {
+        this.recentToolCalls.shift();
+      }
+
+      let resultText: string;
 
       // Handle cron tool
       if (fullToolName === 'cron') {
         const result = await executeCronTool(this.context.cronScheduler, toolArgs as CronToolParams);
-        return result.message;
+        resultText = result.message;
+      }
+
+      // Handle dynamic tools (e.g., QQ)
+      else if (this.dynamicTools.has(fullToolName)) {
+        const dynamicTool = this.dynamicTools.get(fullToolName)!;
+        // Track if qq tool is called
+        if (fullToolName === 'qq') {
+          this.qqToolCalledInSession = true;
+          console.log('[Engine] qq tool called, marking session');
+        }
+        resultText = await dynamicTool.executor(toolArgs);
       }
 
       // Check if it's a skill (no underscore prefix)
-      if (!fullToolName.includes('_')) {
+      else if (!fullToolName.includes('_')) {
         const skill = this.context.skillRegistry.getSkill(fullToolName);
         if (skill) {
-          return await this.executeSkillByName(skill, toolArgs);
+          resultText = await this.executeSkillByName(skill, toolArgs);
+        } else {
+          throw new Error(`Unknown tool/skill: ${fullToolName}`);
         }
       }
 
       // It's an MCP tool - parse server and tool name
-      const underscoreIndex = fullToolName.indexOf('_');
-      if (underscoreIndex === -1) {
-        throw new Error(`Invalid tool name format: ${fullToolName}`);
+      else {
+        const underscoreIndex = fullToolName.indexOf('_');
+        if (underscoreIndex === -1) {
+          throw new Error(`Invalid tool name format: ${fullToolName}`);
+        }
+
+        const serverName = fullToolName.substring(0, underscoreIndex);
+        const toolName = fullToolName.substring(underscoreIndex + 1);
+
+        // Execute MCP tool
+        const result = await this.context.mcpManager.callToolOnServer(
+          serverName,
+          toolName,
+          toolArgs
+        );
+
+        if (result.isError) {
+          const errorMsg = result.content?.[0]?.text || 'Unknown error';
+          console.log(`[Engine] MCP tool error: ${errorMsg}`);
+          return `Error: ${errorMsg}`;
+        }
+
+        resultText = result.content?.[0]?.text || 'Success';
       }
 
-      const serverName = fullToolName.substring(0, underscoreIndex);
-      const toolName = fullToolName.substring(underscoreIndex + 1);
-
-      // Execute MCP tool
-      const result = await this.context.mcpManager.callToolOnServer(
-        serverName,
-        toolName,
-        toolArgs
-      );
-
-      if (result.isError) {
-        const errorMsg = result.content?.[0]?.text || 'Unknown error';
-        console.log(`[Engine] MCP tool error: ${errorMsg}`);
-        return `Error: ${errorMsg}`;
+      // Truncate long tool results to prevent context overflow
+      const maxToolResultLength = 24000; // ~6000 tokens at 4 chars/token
+      if (resultText.length > maxToolResultLength) {
+        const headChars = Math.floor(maxToolResultLength * 0.3);
+        const tailChars = Math.floor(maxToolResultLength * 0.3);
+        const head = resultText.slice(0, headChars);
+        const tail = resultText.slice(-tailChars);
+        const omitted = resultText.length - headChars - tailChars;
+        resultText = `${head}\n\n[...${omitted} characters omitted...]\n\n${tail}`;
+        console.log(`[Engine] Tool result truncated: ${resultText.length} chars (was ${resultText.length + omitted})`);
       }
 
-      const resultText = result.content?.[0]?.text || 'Success';
-      console.log(`[Engine] MCP tool result: ${resultText.slice(0, 100)}...`);
+      console.log(`[Engine] Tool result: ${resultText.slice(0, 100)}...`);
       return resultText;
     } catch (error) {
       const errorMsg = error instanceof Error ? error.message : String(error);
@@ -676,21 +1143,6 @@ export class CoreEngine {
   /**
    * Handle agent turn from cron jobs
    */
-  async handleAgentTurn(job: { name: string; payload: { kind: string; message?: string } }): Promise<string> {
-    console.log(`[Engine] Handling agent turn for job: ${job.name}`);
-
-    if (job.payload.kind !== 'agentTurn') {
-      return '[Error: Not an agentTurn payload]';
-    }
-
-    // Add system message about scheduled task
-    const systemMessage = `[Scheduled Task] ${job.name}: ${job.payload.message || ''}`;
-    this.context.messages.push({ role: 'user', content: systemMessage });
-
-    // Process the task
-    return await this.processUserInput(job.payload.message || '');
-  }
-
   /**
    * Extract message from cli-bridge tool arguments
    * Handles both direct message format and legacy action/params format

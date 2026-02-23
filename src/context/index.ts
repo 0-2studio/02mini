@@ -52,3 +52,24 @@ export {
   heavyCompaction,
   extractKeyFacts,
 } from './compaction.js';
+
+// AI Summarizer
+export {
+  summarizeWithAI,
+  aiMediumCompaction,
+  aiHeavyCompaction,
+  createAISummaryBlocks,
+  selectMessagesForSummarization,
+} from './ai-summarizer.js';
+
+// Tool Truncation
+export {
+  calculateMaxToolResultChars,
+  truncateToolResult,
+  truncateMessageIfToolResult,
+  truncateToolResults,
+  isOversizedToolResult,
+  softTrimToolResult,
+  hardClearToolResult,
+} from './tool-truncation.js';
+export type { TruncationConfig } from './tool-truncation.js';

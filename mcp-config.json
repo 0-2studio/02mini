@@ -10,6 +10,14 @@
       "env": {
         "DEFAULT_LIMIT": "50000"
       }
+    },
+    "mcp-server-code-runner": {
+      "command": "npx",
+      "args": [
+        "-y",
+        "@iflow-mcp/mcp-server-code-runner"
+      ],
+      "values": {}
     }
   }
 }

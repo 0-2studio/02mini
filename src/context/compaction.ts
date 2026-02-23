@@ -14,6 +14,7 @@ import type {
 import { COMPACTION_STRATEGIES, type KeyFact } from './types.js';
 import { countConversationTokens, countMessageTokens, TOKEN_CONFIG } from './tokens.js';
 import { pruneMessages, emergencyPrune } from './pruner.js';
+import { aiMediumCompaction, aiHeavyCompaction } from './ai-summarizer.js';
 
 /**
  * Simple summarization without AI (for fallback)
@@ -125,123 +126,71 @@ async function createSummaryBlocks(
 }
 
 /**
- * Medium compression - prune + simple summarization
+ * Medium compression - AI-powered summarization
+ * Uses AI to intelligently summarize older messages
  */
 export async function mediumCompaction(
   messages: ChatMessage[],
-  targetTokens: number = TOKEN_CONFIG.targetTokensAfterCompression
+  targetTokens: number = TOKEN_CONFIG.targetTokensAfterCompression,
+  aiClient?: { chatCompletion: (messages: ChatMessage[], tools?: any[]) => Promise<any> }
 ): Promise<CompactionResult> {
   const { total: originalTokens } = countConversationTokens(messages);
   
-  // First pass: prune low-importance messages
-  const pruned = pruneMessages(
+  // Use AI for intelligent summarization
+  const { summaryMessage, keptMessages, summaryBlocks } = await aiMediumCompaction(
     messages,
-    targetTokens * 1.5, // Aim higher initially
-    {
-      protectSystem: true,
-      protectRecent: 4,
-      protectIncompleteToolChains: true,
-      protectKeywords: ['important', 'remember', 'critical'],
-      minMessagesToKeep: 6,
-    }
+    targetTokens,
+    aiClient
   );
   
-  // Get remaining messages
-  const remainingIndices = new Set(pruned.removedIndices);
-  const remainingMessages = messages.filter((_, idx) => !remainingIndices.has(idx));
+  // Combine summary with kept messages
+  const finalMessages = [summaryMessage, ...keptMessages.filter(m => m.role !== 'system')];
+  const { total: compressedTokens } = countConversationTokens(finalMessages);
   
-  // Second pass: summarize older message groups
-  const { total: afterPruneTokens } = countConversationTokens(remainingMessages);
+  // Calculate removed indices
+  const keptSet = new Set(keptMessages);
+  const removedIndices = messages
+    .map((_, idx) => idx)
+    .filter(idx => !keptSet.has(messages[idx]) && messages[idx].role !== 'system');
   
-  if (afterPruneTokens > targetTokens && remainingMessages.length > 8) {
-    // Group older messages for summarization
-    const olderMessages = remainingMessages.slice(0, -4); // Keep last 4 intact
-    const recentMessages = remainingMessages.slice(-4);
-    
-    const groups = groupMessagesForSummarization(olderMessages, 4);
-    const summaryBlocks = await createSummaryBlocks(groups);
-    
-    // Create summary message
-    const summaryContent = summaryBlocks.map(b => b.summary).join('\n\n');
-    const summaryMessage: ChatMessage = {
-      role: 'assistant',
-      content: `[Earlier conversation summarized]\n\n${summaryContent}`,
-    };
-    
-    const finalMessages = [summaryMessage, ...recentMessages];
-    const { total: compressedTokens } = countConversationTokens(finalMessages);
-    
-    return {
-      level: 'medium',
-      originalMessages: messages.length,
-      compressedMessages: finalMessages.length,
-      originalTokens,
-      compressedTokens,
-      removedIndices: pruned.removedIndices,
-      summarizedBlocks: summaryBlocks,
-      success: compressedTokens <= targetTokens * 1.2,
-    };
-  }
-  
-  // Pruning was sufficient
   return {
     level: 'medium',
     originalMessages: messages.length,
-    compressedMessages: remainingMessages.length,
+    compressedMessages: finalMessages.length,
     originalTokens,
-    compressedTokens: afterPruneTokens,
-    removedIndices: pruned.removedIndices,
-    summarizedBlocks: [],
-    success: afterPruneTokens <= targetTokens * 1.2,
+    compressedTokens,
+    removedIndices,
+    summarizedBlocks: summaryBlocks,
+    success: compressedTokens <= targetTokens * 1.2,
   };
 }
 
 /**
- * Heavy compression - aggressive pruning and summarization
+ * Heavy compression - AI-powered aggressive summarization
  */
 export async function heavyCompaction(
   messages: ChatMessage[],
-  targetTokens: number = TOKEN_CONFIG.targetTokensAfterCompression * 0.8
+  targetTokens: number = TOKEN_CONFIG.targetTokensAfterCompression * 0.8,
+  aiClient?: { chatCompletion: (messages: ChatMessage[], tools?: any[]) => Promise<any> }
 ): Promise<CompactionResult> {
   const { total: originalTokens } = countConversationTokens(messages);
   
-  // Keep only system and most recent messages
-  const systemMessages = messages.filter(m => m.role === 'system');
-  const nonSystemMessages = messages.filter(m => m.role !== 'system');
+  // Use AI for aggressive summarization
+  const { summaryMessage, keptMessages, summaryBlocks } = await aiHeavyCompaction(
+    messages,
+    targetTokens,
+    aiClient
+  );
   
-  // Extract key facts before removing
-  const keyFacts = extractKeyFacts(nonSystemMessages);
-  
-  // Keep recent messages
-  const recentMessages = nonSystemMessages.slice(-3);
-  const olderMessages = nonSystemMessages.slice(0, -3);
-  
-  // Create comprehensive summary of older messages
-  let summaryContent = '';
-  if (olderMessages.length > 0) {
-    const summary = createSimpleSummary(olderMessages);
-    const factsText = keyFacts.slice(-5).map(f => `- ${f.fact}`).join('\n');
-    summaryContent = `[${olderMessages.length} earlier messages]\n${summary}\n\nKey facts:\n${factsText}`;
-  }
-  
-  const finalMessages: ChatMessage[] = [
-    ...systemMessages,
-  ];
-  
-  if (summaryContent) {
-    finalMessages.push({
-      role: 'assistant',
-      content: summaryContent,
-    });
-  }
-  
-  finalMessages.push(...recentMessages);
-  
+  // Combine summary with kept messages
+  const finalMessages = [summaryMessage, ...keptMessages.filter(m => m.role !== 'system')];
   const { total: compressedTokens } = countConversationTokens(finalMessages);
   
+  // Calculate removed indices
+  const keptSet = new Set(keptMessages);
   const removedIndices = messages
     .map((_, idx) => idx)
-    .filter(idx => !finalMessages.includes(messages[idx]));
+    .filter(idx => !keptSet.has(messages[idx]) && messages[idx].role !== 'system');
   
   return {
     level: 'heavy',
@@ -250,12 +199,7 @@ export async function heavyCompaction(
     originalTokens,
     compressedTokens,
     removedIndices,
-    summarizedBlocks: olderMessages.length > 0 ? [{
-      originalRange: [0, olderMessages.length - 1],
-      summary: summaryContent,
-      tokenCount: countMessageTokens({ role: 'assistant', content: summaryContent }),
-      keyFacts: keyFacts.map(f => f.fact),
-    }] : [],
+    summarizedBlocks: summaryBlocks,
     success: compressedTokens <= targetTokens * 1.2,
   };
 }
@@ -266,7 +210,8 @@ export async function heavyCompaction(
 export async function compactContext(
   messages: ChatMessage[],
   level: CompactionLevel = 'medium',
-  customTargetTokens?: number
+  customTargetTokens?: number,
+  aiClient?: { chatCompletion: (messages: ChatMessage[], tools?: any[]) => Promise<any> }
 ): Promise<CompactionResult> {
   const strategy = COMPACTION_STRATEGIES[level];
   const targetTokens = customTargetTokens || strategy.targetTokens;
@@ -288,10 +233,10 @@ export async function compactContext(
       return pruneMessages(messages, targetTokens, strategy.rules);
     
     case 'medium':
-      return mediumCompaction(messages, targetTokens);
+      return mediumCompaction(messages, targetTokens, aiClient);
     
     case 'heavy':
-      return heavyCompaction(messages, targetTokens);
+      return heavyCompaction(messages, targetTokens, aiClient);
     
     case 'emergency':
       return emergencyPrune(messages, strategy.maxTokens, strategy.rules.minMessagesToKeep);
@@ -303,15 +248,23 @@ export async function compactContext(
 
 /**
  * Incremental compaction - try levels progressively
+ * New thresholds:
+ * - <=90%: No compaction
+ * - 90-95%: Light compression (pruning)
+ * - 95-98%: Medium compression (AI summarization)
+ * - >=98%: Heavy compression (AI aggressive summarization)
+ * - >=100%: Emergency pruning
  */
 export async function incrementalCompaction(
   messages: ChatMessage[],
-  maxTokens: number = TOKEN_CONFIG.maxHistoryTokens
+  maxTokens: number = TOKEN_CONFIG.maxHistoryTokens,
+  aiClient?: { chatCompletion: (messages: ChatMessage[], tools?: any[]) => Promise<any> }
 ): Promise<CompactionResult> {
   const { total } = countConversationTokens(messages);
+  const percentage = total / maxTokens;
   
-  if (total <= maxTokens * 0.7) {
-    // No compaction needed
+  if (percentage <= 0.9) {
+    // No compaction needed (<90%)
     return {
       level: 'none',
       originalMessages: messages.length,
@@ -324,20 +277,21 @@ export async function incrementalCompaction(
     };
   }
   
-  // Try light first
-  if (total <= maxTokens * 0.85) {
+  // Light compression at 90-95%
+  if (percentage <= 0.95) {
     return pruneMessages(messages, TOKEN_CONFIG.targetTokensAfterCompression, COMPACTION_STRATEGIES.light.rules);
   }
   
-  // Try medium
-  if (total <= maxTokens * 0.95) {
-    return mediumCompaction(messages);
+  // Medium compression at 95-98% (use AI)
+  if (percentage <= 0.98) {
+    return mediumCompaction(messages, TOKEN_CONFIG.targetTokensAfterCompression, aiClient);
   }
   
-  // Heavy or emergency
-  if (total >= maxTokens) {
-    return emergencyPrune(messages, maxTokens);
+  // Heavy compression at 98-100% (use AI)
+  if (percentage < 1.0) {
+    return heavyCompaction(messages, TOKEN_CONFIG.targetTokensAfterCompression * 0.8, aiClient);
   }
   
-  return heavyCompaction(messages);
+  // Emergency pruning at >=100%
+  return emergencyPrune(messages, maxTokens);
 }

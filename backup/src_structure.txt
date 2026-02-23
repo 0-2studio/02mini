@@ -1,0 +1,13 @@
+src/
+├── ai/
+├── autonomous/
+├── cli/
+├── context/
+├── core/
+├── cron/
+├── gateway/
+├── heartbeat/
+├── index.ts (main entry point)
+├── mcp/
+├── qq/
+└── skills-impl/

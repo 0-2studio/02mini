@@ -264,7 +264,7 @@ export class AutonomousRunner extends EventEmitter {
   }
 
   /**
-   * Build the heartbeat prompt
+   * Build the heartbeat prompt with detailed system status
    */
   private buildHeartbeatPrompt(): string {
     const now = new Date();
@@ -273,17 +273,55 @@ export class AutonomousRunner extends EventEmitter {
     // Get scheduled tasks info
     const jobs = this.cronScheduler.getJobs();
     const enabledJobs = jobs.filter((j) => j.enabled);
+    const pendingJobs = jobs.filter((j) => {
+      if (!j.enabled || !j.state.nextRunAtMs) return false;
+      return j.state.nextRunAtMs <= Date.now();
+    });
+
+    // Find overdue jobs (should have run but haven't)
+    const overdueJobs = jobs.filter((j) => {
+      if (!j.enabled || !j.state.nextRunAtMs) return false;
+      // Overdue if next run was more than 1 minute ago
+      return j.state.nextRunAtMs < Date.now() - 60000;
+    });
 
     const replacements: Record<string, string> = {
       time: now.toLocaleTimeString('zh-CN'),
       date: now.toLocaleDateString('zh-CN'),
       lastInteraction: this.formatDuration(Date.now() - this.lastUserInteraction),
       scheduledTasks: enabledJobs.length > 0
-        ? enabledJobs.map((j) => `- ${j.name} (${j.schedule.kind})`).join('\n')
-        : 'None',
+        ? enabledJobs.map((j) => {
+            const nextRun = j.state.nextRunAtMs 
+              ? new Date(j.state.nextRunAtMs).toLocaleTimeString('zh-CN')
+              : 'N/A';
+            const status = j.state.nextRunAtMs && j.state.nextRunAtMs <= Date.now() ? ' [DUE]' : '';
+            return `- ${j.name}: ${j.schedule.kind} (next: ${nextRun})${status}`;
+          }).join('\n')
+        : 'No scheduled tasks',
+      pendingCount: String(pendingJobs.length),
+      overdueCount: String(overdueJobs.length),
+      totalJobs: String(jobs.length),
     };
 
-    return template.replace(/\{\{(\w+)\}\}/g, (match, key) => replacements[key] || match);
+    let prompt = template.replace(/\{\{(\w+)\}\}/g, (match, key) => replacements[key] || match);
+
+    // Add explicit instructions for overdue jobs
+    if (overdueJobs.length > 0) {
+      prompt += `\n\n⚠️ OVERDUE JOBS DETECTED:\n`;
+      overdueJobs.forEach(j => {
+        prompt += `- "${j.name}" was scheduled for ${new Date(j.state.nextRunAtMs!).toLocaleString()}\n`;
+      });
+      prompt += `\nConsider notifying the user about these overdue items.`;
+    }
+
+    if (pendingJobs.length > 0) {
+      prompt += `\n\n📋 JOBS DUE NOW:\n`;
+      pendingJobs.forEach(j => {
+        prompt += `- "${j.name}" (${j.payload.kind})\n`;
+      });
+    }
+
+    return prompt;
   }
 
   /**

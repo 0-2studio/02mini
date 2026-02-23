@@ -8,6 +8,7 @@ import { HeartbeatScheduler } from './heartbeat/scheduler.js';
 import { CronScheduler } from './cron/index.js';
 import { GatewayServer } from './gateway/index.js';
 import { AutonomousRunner } from './autonomous/index.js';
+import { QQAdapter, QQConfigManager, createQQTools, executeQQTool } from './qq/index.js';
 import path from 'path';
 import { fileURLToPath } from 'url';
 
@@ -26,6 +27,13 @@ async function main() {
   await cronScheduler.init();
   cronScheduler.start();
   console.log(`[02] Cron scheduler started with ${cronScheduler.getJobs().length} job(s)`);
+
+  // Initialize QQ Config Manager
+  console.log('[02] Initializing QQ config manager...');
+  const qqConfigManager = new QQConfigManager(workingDir);
+  await qqConfigManager.load();
+  const qqConfig = qqConfigManager.getConfig();
+  console.log(`[02] QQ adapter: ${qqConfig.enabled ? 'enabled' : 'disabled'}`);
 
   // Listen for cron events
   cronScheduler.on('job:triggered', (job) => {
@@ -94,6 +102,39 @@ async function main() {
       cli.printProactiveMessage(content, trigger);
     });
 
+    // Start QQ Adapter if enabled
+    let qqAdapter: QQAdapter | null = null;
+    if (qqConfigManager.getConfig().enabled) {
+      console.log('[02] Starting QQ adapter...');
+      qqAdapter = new QQAdapter({
+        workingDir,
+        engine,
+        configManager: qqConfigManager,
+      });
+      await qqAdapter.start();
+      
+      // Schedule periodic file cleanup (every 24 hours, delete files older than 7 days)
+      qqAdapter.scheduleFileCleanup(24);
+      
+      // Set up CLI command handler for QQ
+      cli.setQQAdapter(qqAdapter, qqConfigManager);
+      
+      // Register QQ tool with engine
+      const qqTool = createQQTools(qqAdapter, qqConfigManager);
+      engine.registerTool('qq', qqTool, async (params) => {
+        const result = await executeQQTool(qqAdapter, qqConfigManager, params);
+        return result.message;
+      });
+      
+      // Add QQ context to system prompt if enabled
+      engine.setQQContext({
+        enabled: true,
+        atRequiredInGroup: qqConfigManager.getConfig().atRequiredInGroup,
+        allowedGroups: Array.from(qqConfigManager.getPermissionsSummary().allowedGroups),
+        allowedUsers: Array.from(qqConfigManager.getPermissionsSummary().allowedUsers),
+      });
+    }
+
     // Connect autonomous to Gateway for WebSocket broadcast
     autonomous.onProactiveMessage((content, trigger) => {
       const context = gateway?.getContext();
@@ -117,14 +158,63 @@ async function main() {
 
   await cli.start();
 
-  // Cleanup on exit
-  process.on('SIGINT', () => {
-    console.log('\n[02] Shutting down...');
-    autonomous?.stop();
-    gateway?.stop();
-    cronScheduler.stop();
-    heartbeatScheduler.stop();
-    process.exit(0);
+  // Cleanup function with proper async handling
+  let isShuttingDown = false;
+  const cleanup = async (signal: string) => {
+    if (isShuttingDown) {
+      console.log('[02] Already shutting down...');
+      return;
+    }
+    isShuttingDown = true;
+    console.log(`\n[02] Received ${signal}, shutting down gracefully...`);
+
+    try {
+      // Stop components in reverse order of initialization
+      if (autonomous) {
+        console.log('[02] Stopping autonomous runner...');
+        autonomous.stop();
+      }
+
+      if (qqAdapter) {
+        console.log('[02] Stopping QQ adapter...');
+        await Promise.race([
+          qqAdapter.stop(),
+          new Promise((_, reject) => setTimeout(() => reject(new Error('QQ adapter stop timeout')), 5000))
+        ]).catch(err => console.error('[02] QQ adapter stop failed:', err));
+      }
+
+      if (gateway) {
+        console.log('[02] Stopping gateway server...');
+        await Promise.race([
+          gateway.stop(),
+          new Promise((_, reject) => setTimeout(() => reject(new Error('Gateway stop timeout')), 5000))
+        ]).catch(err => console.error('[02] Gateway stop failed:', err));
+      }
+
+      console.log('[02] Stopping schedulers...');
+      cronScheduler.stop();
+      heartbeatScheduler.stop();
+
+      console.log('[02] Cleanup complete. Goodbye!');
+    } catch (error) {
+      console.error('[02] Error during cleanup:', error);
+    } finally {
+      process.exit(0);
+    }
+  };
+
+  // Handle multiple termination signals
+  process.on('SIGINT', () => cleanup('SIGINT'));
+  process.on('SIGTERM', () => cleanup('SIGTERM'));
+
+  // Handle uncaught errors
+  process.on('uncaughtException', (error) => {
+    console.error('[02] Uncaught exception:', error);
+    cleanup('uncaughtException');
+  });
+
+  process.on('unhandledRejection', (reason, promise) => {
+    console.error('[02] Unhandled rejection at:', promise, 'reason:', reason);
   });
 }
 
