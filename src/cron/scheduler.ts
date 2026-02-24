@@ -32,6 +32,7 @@ export class CronScheduler extends EventEmitter {
   private timer: NodeJS.Timeout | null = null;
   private systemEvents: PendingSystemEvent[] = [];
   private running: boolean = false;
+  private executingJobs: Set<string> = new Set(); // Track jobs currently executing
 
   constructor(workingDir: string) {
     super();
@@ -84,8 +85,11 @@ export class CronScheduler extends EventEmitter {
         const everyMs = Math.max(1000, schedule.everyMs); // Minimum 1 second
         const anchor = schedule.anchorMs ?? fromMs;
         const elapsed = fromMs - anchor;
-        const nextOffset = Math.ceil(elapsed / everyMs) * everyMs;
-        return anchor + nextOffset;
+        // Calculate next occurrence strictly in the future
+        const nextOffset = Math.floor(elapsed / everyMs) * everyMs + everyMs;
+        const nextRun = anchor + nextOffset;
+        // Ensure it's strictly after fromMs (at least 1ms buffer)
+        return nextRun > fromMs ? nextRun : fromMs + everyMs;
       }
 
       case 'cron': {
@@ -246,12 +250,23 @@ export class CronScheduler extends EventEmitter {
     if (!this.running) return;
 
     const now = Date.now();
-    const dueJobs = this.store.getAllJobs().filter(j => 
-      j.enabled && j.state.nextRunAtMs && j.state.nextRunAtMs <= now
+    // Filter: enabled, has nextRunAtMs, time is due, and not currently executing
+    const dueJobs = this.store.getAllJobs().filter(j =>
+      j.enabled &&
+      j.state.nextRunAtMs &&
+      j.state.nextRunAtMs <= now &&
+      !this.executingJobs.has(j.id) // Skip if already executing
     );
 
     for (const job of dueJobs) {
-      await this.executeJob(job);
+      // Mark as executing before starting
+      this.executingJobs.add(job.id);
+      try {
+        await this.executeJob(job);
+      } finally {
+        // Always remove from executing set when done
+        this.executingJobs.delete(job.id);
+      }
     }
 
     // Re-arm timer for next check
@@ -262,7 +277,12 @@ export class CronScheduler extends EventEmitter {
    * Execute a job
    */
   private async executeJob(job: CronJob): Promise<void> {
-    console.log(`[CronScheduler] Executing job: ${job.name}`);
+    const executeStartTime = Date.now();
+    console.log(`[CronScheduler] Executing job: ${job.name} at ${new Date(executeStartTime).toISOString()}`);
+
+    // CRITICAL: Clear nextRunAtMs BEFORE execution to prevent re-selection
+    // This ensures even if execution takes long, the job won't be picked up again
+    await this.store.updateJobState(job.id, { nextRunAtMs: undefined });
 
     this.emit('job:triggered', job);
 
@@ -289,13 +309,18 @@ export class CronScheduler extends EventEmitter {
         await this.store.removeJob(job.id);
         console.log(`[CronScheduler] Removed one-time job: ${job.name}`);
       } else {
-        // Compute next run
-        const nextRun = this.computeNextRun(job.schedule);
+        // Compute next run based on execution completion time
+        const afterExecuteTime = Date.now();
+        const nextRun = this.computeNextRun(job.schedule, afterExecuteTime);
         if (nextRun) {
-          await this.store.updateJobState(job.id, { nextRunAtMs: nextRun });
+          // Ensure nextRun is strictly in the future
+          const safeNextRun = Math.max(nextRun, afterExecuteTime + 1000); // At least 1 second in future
+          await this.store.updateJobState(job.id, { nextRunAtMs: safeNextRun });
+          console.log(`[CronScheduler] Job ${job.name} next run at ${new Date(safeNextRun).toISOString()}`);
         } else {
           // No next run (e.g., past at-schedule), disable it
           await this.store.updateJob(job.id, { enabled: false });
+          console.log(`[CronScheduler] Job ${job.name} disabled (no future runs)`);
         }
       }
 
@@ -303,16 +328,16 @@ export class CronScheduler extends EventEmitter {
     } catch (error) {
       const errorMsg = error instanceof Error ? error.message : String(error);
       console.error(`[CronScheduler] Job ${job.name} failed:`, errorMsg);
-      
+
       await this.store.markJobRun(job.id, false, errorMsg);
-      
+
       // Apply error backoff
       const backoffIndex = Math.min(job.state.consecutiveErrors, ERROR_BACKOFF_MS.length - 1);
       const backoffMs = ERROR_BACKOFF_MS[backoffIndex];
       const retryAt = Date.now() + backoffMs;
-      
+
       await this.store.updateJobState(job.id, { nextRunAtMs: retryAt });
-      
+
       this.emit('job:completed', job, false, errorMsg);
     }
   }

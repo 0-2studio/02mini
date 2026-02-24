@@ -386,12 +386,14 @@ export class CoreEngine {
       '- Incomplete tool call chains',
       '- Your summaries of older context (AI-generated)',
       '',
-      '### AFTER Compression - RECOVER from Memory',
-      'If context was compressed and you need forgotten information:',
-      '1. Check memory/daily-logs/ for recent conversation summary',
-      '2. Read memory/user-profile.md for user preferences',
-      '3. Search memory/knowledge/ for technical details',
-      '4. If still missing, ask user: "The context was compressed. Could you remind me of [specific detail]?"',
+      '### AFTER Compression - ONE-TIME Memory Review',
+      'When context is compressed, perform a ONE-TIME memory review:',
+      '1. Read key memory files (user-profile.md, recent daily-logs/) to restore context',
+      '2. AFTER this review, continue normally WITHOUT repeatedly reading memory files',
+      '3. Only read memory again if specifically needed for the current task',
+      '4. If details are missing, ask: "Could you remind me of [specific detail]?"',
+      '',
+      'Note: This is a ONE-TIME recovery. Do not continuously check memory files after the review.',
       '',
       '### Prevention - Keep Context Healthy',
       '- Save important info to memory BEFORE it gets compressed',
@@ -539,6 +541,12 @@ export class CoreEngine {
       lines.push(`- Allowed private users: ${this.qqContext.allowedUsers.join(', ')}`);
     }
 
+    lines.push('');
+    lines.push('### How to @ Mention Someone in QQ');
+    lines.push('To @ mention a user in a group message, include the CQ code directly in the message text:');
+    lines.push('- Format: [CQ:at,qq=USER_ID] where USER_ID is the numeric QQ ID');
+    lines.push('- Example: {"action":"send_group_message","group_id":123,"message":"Hello [CQ:at,qq=456789], how are you?"}');
+    lines.push('- IMPORTANT: There is NO separate "at" parameter. Put the CQ code inside the message field.');
     lines.push('');
     lines.push('### QQ Message Format');
     lines.push('When you receive QQ messages, they will be prefixed with:');
@@ -704,9 +712,11 @@ export class CoreEngine {
         return `[Error: AI call failed - ${error instanceof Error ? error.message : String(error)}]`;
       }
 
-      // Check for rate limit error (status 449) - skip without waiting
+      // Check for rate limit error (status 449) - wait 10 seconds before continuing
       if (response && response.status === '449') {
-        console.log('[Engine] Rate limit hit (status 449), skipping without retry');
+        console.log('[Engine] Rate limit hit (status 449), waiting 10 seconds...');
+        await new Promise(resolve => setTimeout(resolve, 10000)); // Wait 10 seconds
+        console.log('[Engine] Wait complete, continuing');
         return '[Error: Rate limit exceeded - please try again later]';
       }
 
@@ -1361,5 +1371,10 @@ export class CoreEngine {
       console.log(`[Engine] Found ${systemEvents.length} system event(s) to process`);
       await this.handleSystemEvents();
     }
+  }
+
+  // Helper method for sleep/delay
+  private sleep(ms: number): Promise<void> {
+    return new Promise(resolve => setTimeout(resolve, ms));
   }
 }

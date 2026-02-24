@@ -68,13 +68,12 @@ You are 02, operating autonomously. This is a SYSTEM MAINTENANCE check.
    - Use cron tool with action="list" to get all scheduled jobs
    - Check if any jobs are overdue or failed
    - Check if any reminders should trigger soon
+   - Note: Scheduled tasks (like daily memory organization) are handled by cron
 
 2. **SYSTEM RESOURCES** (MUST CHECK)
    - Check if context window needs compression
-   - Review if old memories should be archived
 
 3. **PENDING TASKS REVIEW**
-   - Check memory/daily-logs/ for incomplete tasks
    - Check if any user requests were left unfinished
 
 4. **PROACTIVE ASSISTANCE**

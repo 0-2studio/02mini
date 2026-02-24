@@ -127,12 +127,26 @@ export interface QQContext {
   sessionId: string;
 }
 
+/** QQ File Info for received/sent files */
+export interface QQFileInfo {
+  fileId: string;
+  fileName: string;
+  fileSize: number;
+  localPath: string;
+  receivedAt: number;
+  senderId: number;
+  groupId?: number;
+  mimeType?: string;
+}
+
 /** QQ Tool parameters */
 export interface QQToolParams {
-  action: 'send_private_message' | 'send_group_message';
+  action: 'send_private_message' | 'send_group_message' | 'send_file';
   user_id?: number;
   group_id?: number;
-  message: string;
+  message?: string;
+  file_path?: string;
+  file_name?: string;
   end?: boolean;
 }
 

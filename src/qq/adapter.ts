@@ -17,6 +17,7 @@ import type {
   MessageSegment,
   QQContext,
   QQSession,
+  QQFileInfo,
 } from './types.js';
 
 export interface QQAdapterOptions {
@@ -45,6 +46,7 @@ interface SessionMessages {
     senderId: number;
     content: string;
     timestamp: number;
+    atList?: Array<{qq: string; name?: string}>; // List of @ mentions
   }>;
 }
 
@@ -69,11 +71,41 @@ export class QQAdapter extends EventEmitter {
   // Track if AI is in the middle of a conversation
   private activeSessions: Set<string> = new Set();
 
+  // API rate limiting - removed for simplicity
+  private lastApiCallTime: number = 0;
+
+  // File upload directory
+  private readonly fileUploadDir: string;
+
+  // Pending files waiting to be downloaded (file_id -> QQFileInfo)
+  private pendingFiles: Map<string, QQFileInfo> = new Map();
+
+  // Reconnection state
+  private reconnectAttempts: number = 0;
+  private readonly maxReconnectAttempts: number = 10;
+  private reconnectDelay: number = 5000; // Start with 5 seconds
+  private readonly maxReconnectDelay: number = 60000; // Max 60 seconds
+  private reconnectTimer?: NodeJS.Timeout;
+  private isReconnecting: boolean = false;
+
   constructor(options: QQAdapterOptions) {
     super();
     this.engine = options.engine;
     this.configManager = options.configManager;
     this.workingDir = options.workingDir;
+    this.fileUploadDir = path.join(this.workingDir, 'files', 'qq-uploads');
+    this.ensureFileUploadDir();
+  }
+
+  /**
+   * Ensure file upload directory exists
+   */
+  private async ensureFileUploadDir(): Promise<void> {
+    try {
+      await fs.mkdir(this.fileUploadDir, { recursive: true });
+    } catch (error) {
+      console.error('[QQ] Failed to create file upload directory:', error);
+    }
   }
 
   /**
@@ -200,6 +232,7 @@ export class QQAdapter extends EventEmitter {
         const clientIp = req.socket.remoteAddress || 'unknown';
         console.log(`[QQ] NapCat connected from ${clientIp}`);
         this.wsClient = ws;
+        this.resetReconnectState();
         this.setupWebSocketHandlers(ws);
       });
 
@@ -239,6 +272,7 @@ export class QQAdapter extends EventEmitter {
         ws.on('open', () => {
           console.log('[QQ] WebSocket connection established');
           this.wsClient = ws;
+          this.resetReconnectState();
           this.setupWebSocketHandlers(ws);
           resolve();
         });
@@ -277,6 +311,11 @@ export class QQAdapter extends EventEmitter {
       console.log(`[QQ] Connection closed. Code: ${code}, Reason: ${reason || 'none'}`);
       this.wsClient = undefined;
       this.stopHeartbeat();
+
+      // Trigger reconnection if not manually stopped and not already reconnecting
+      if (this.isRunning && !this.isReconnecting) {
+        this.scheduleReconnect();
+      }
     });
 
     ws.on('error', (error) => {
@@ -293,10 +332,12 @@ export class QQAdapter extends EventEmitter {
 
   private startHeartbeat(ws: WebSocket): void {
     this.stopHeartbeat();
+    // Send ping frame instead of get_version API
     this.heartbeatInterval = setInterval(() => {
       if (ws.readyState === WebSocket.OPEN) {
         try {
-          ws.send(JSON.stringify({ action: 'get_version' }));
+          ws.ping();
+          console.log('[QQ] Heartbeat ping sent');
         } catch (error) {
           console.error('[QQ] Heartbeat failed:', error);
         }
@@ -311,9 +352,82 @@ export class QQAdapter extends EventEmitter {
     }
   }
 
+  // ==================== Reconnection Logic ====================
+
+  private resetReconnectState(): void {
+    this.reconnectAttempts = 0;
+    this.reconnectDelay = 5000;
+    this.isReconnecting = false;
+    if (this.reconnectTimer) {
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = undefined;
+    }
+    console.log('[QQ] Reconnection state reset');
+  }
+
+  private scheduleReconnect(): void {
+    if (this.reconnectTimer) {
+      clearTimeout(this.reconnectTimer);
+    }
+
+    if (this.reconnectAttempts >= this.maxReconnectAttempts) {
+      console.log(`[QQ] Max reconnection attempts (${this.maxReconnectAttempts}) reached. Giving up.`);
+      return;
+    }
+
+    this.isReconnecting = true;
+    this.reconnectAttempts++;
+
+    console.log(`[QQ] Reconnecting in ${this.reconnectDelay / 1000}s... (attempt ${this.reconnectAttempts}/${this.maxReconnectAttempts})`);
+
+    this.reconnectTimer = setTimeout(() => {
+      this.performReconnect();
+    }, this.reconnectDelay);
+
+    // Exponential backoff with jitter
+    this.reconnectDelay = Math.min(
+      this.reconnectDelay * 1.5 + Math.random() * 2000,
+      this.maxReconnectDelay
+    );
+  }
+
+  private async performReconnect(): Promise<void> {
+    try {
+      const config = this.configManager.getConfig();
+
+      if (!config.enabled || !this.isRunning) {
+        console.log('[QQ] Reconnection aborted - adapter disabled or stopped');
+        this.isReconnecting = false;
+        return;
+      }
+
+      console.log(`[QQ] Attempting to reconnect...`);
+
+      if (config.mode === 'websocket-client') {
+        await this.startWebSocketClient();
+      } else {
+        // For server mode, just wait for new connections
+        console.log('[QQ] Server mode - waiting for NapCat to reconnect...');
+      }
+
+      // Reset reconnect delay on successful connection
+      this.reconnectDelay = 5000;
+      this.isReconnecting = false;
+      console.log(`[QQ] Reconnection successful!`);
+    } catch (error) {
+      console.error('[QQ] Reconnection failed:', error);
+      this.isReconnecting = false;
+
+      // Schedule next attempt if still running
+      if (this.isRunning) {
+        this.scheduleReconnect();
+      }
+    }
+  }
+
   // ==================== Event Handling ====================
 
-  private handleEvent(event: OneBotEvent, ws: WebSocket): void {
+  private async handleEvent(event: OneBotEvent, ws: WebSocket): Promise<void> {
     // Handle meta events
     if (event.post_type === 'meta_event') {
       const metaEvent = event as OneBotMetaEvent;
@@ -327,11 +441,11 @@ export class QQAdapter extends EventEmitter {
     // Handle message events
     if (event.post_type === 'message') {
       const msgEvent = event as OneBotMessageEvent;
-      this.handleMessageEvent(msgEvent, ws);
+      await this.handleMessageEvent(msgEvent, ws);
     }
   }
 
-  private handleMessageEvent(event: OneBotMessageEvent, ws: WebSocket): void {
+  private async handleMessageEvent(event: OneBotMessageEvent, ws: WebSocket): Promise<void> {
     // Check permissions
     if (!this.checkPermissions(event)) {
       return;
@@ -348,6 +462,14 @@ export class QQAdapter extends EventEmitter {
       return;
     }
 
+    // Check for file/image messages and store info (but don't download yet)
+    const fileInfo = await this.detectFileMessage(event);
+    if (fileInfo) {
+      console.log(`[QQ] File detected: ${fileInfo.fileName} (${fileInfo.fileSize} bytes) - use receive_file tool to download`);
+      // Store file info for later retrieval
+      this.pendingFiles.set(fileInfo.fileId, fileInfo);
+    }
+
     // Add to queue
     this.messageQueue.push({
       event,
@@ -358,29 +480,347 @@ export class QQAdapter extends EventEmitter {
     console.log(`[QQ] Queued message from ${event.user_id}: ${text?.slice(0, 30) || '(empty)'}`);
   }
 
+  /**
+   * Detect file/image messages in the event - just record info, don't download
+   */
+  private async detectFileMessage(event: OneBotMessageEvent): Promise<QQFileInfo | null> {
+    if (typeof event.message === 'string') {
+      return null;
+    }
+
+    for (const segment of event.message) {
+      if (segment.type === 'file' && segment.data) {
+        const fileId = segment.data.file_id;
+        
+        // Debug: log all available fields
+        console.log(`[QQ] File segment raw data keys:`, Object.keys(segment.data));
+        console.log(`[QQ] File segment full data:`, JSON.stringify(segment.data, null, 2));
+
+        // Try multiple possible field names for filename according to OneBot 11 spec
+        // NapCat/OneBot 可能使用不同的字段名
+        const possibleFileNames = [
+          segment.data.file_name,
+          segment.data.name,
+          segment.data.file,
+          segment.data.file_name,
+          segment.data.filename,
+          segment.data.path?.split('/').pop(),
+          segment.data.path?.split('\\').pop(),
+        ].filter(Boolean);
+
+        const fileName = possibleFileNames[0] || 'unnamed_file';
+        console.log(`[QQ] File name candidates:`, possibleFileNames);
+        console.log(`[QQ] Selected file name: ${fileName}`);
+        
+        const fileSize = segment.data.file_size 
+          || segment.data.size 
+          || 0;
+
+        console.log(`[QQ] File detected - ID: ${fileId}, Name: ${fileName}, Size: ${fileSize}`);
+
+        // Generate safe filename but preserve original name
+        const dateDir = new Date().toISOString().split('T')[0];
+        const targetDir = path.join(this.fileUploadDir, dateDir);
+        await fs.mkdir(targetDir, { recursive: true });
+        
+        // Sanitize filename for filesystem
+        const safeFileName = fileName !== 'unnamed_file' ? this.sanitizeFileName(fileName) : `unnamed_${Date.now()}`;
+        const localPath = path.join(targetDir, safeFileName);
+
+        const fileInfo: QQFileInfo = {
+          fileId,
+          fileName: safeFileName,
+          fileSize,
+          localPath,
+          receivedAt: Date.now(),
+          senderId: event.user_id,
+          groupId: event.group_id,
+          mimeType: this.getMimeType(safeFileName),
+        };
+
+        return fileInfo;
+      } else if (segment.type === 'image' && segment.data) {
+        // Debug: log all available fields
+        console.log(`[QQ] Image segment raw data keys:`, Object.keys(segment.data));
+        console.log(`[QQ] Image segment full data:`, JSON.stringify(segment.data, null, 2));
+
+        // For images, use url or file_id as ID
+        const fileId = segment.data.file_id || segment.data.url || segment.data.file;
+
+        // Try multiple possible field names for filename
+        const possibleFileNames = [
+          segment.data.file_name,
+          segment.data.name,
+          segment.data.file,
+          segment.data.filename,
+          'image.jpg',
+        ].filter(Boolean);
+
+        const fileName = possibleFileNames[0] || 'image.jpg';
+        console.log(`[QQ] Image name candidates:`, possibleFileNames);
+        console.log(`[QQ] Selected image name: ${fileName}`);
+        
+        const fileSize = segment.data.file_size 
+          || segment.data.size 
+          || 0;
+
+        console.log(`[QQ] Image detected - ID: ${fileId?.substring(0, 50)}, Name: ${fileName}, Size: ${fileSize}`);
+
+        const dateDir = new Date().toISOString().split('T')[0];
+        const targetDir = path.join(this.fileUploadDir, dateDir);
+        await fs.mkdir(targetDir, { recursive: true });
+        
+        const safeFileName = this.sanitizeFileName(fileName);
+        const localPath = path.join(targetDir, safeFileName);
+
+        const fileInfo: QQFileInfo = {
+          fileId: fileId || `img_${Date.now()}`,
+          fileName: safeFileName,
+          fileSize,
+          localPath,
+          receivedAt: Date.now(),
+          senderId: event.user_id,
+          groupId: event.group_id,
+          mimeType: 'image/jpeg',
+        };
+
+        return fileInfo;
+      }
+    }
+
+    return null;
+  }
+
+  /**
+   * Receive/download a file - called by AI via tool
+   * Downloads file from QQ server via NapCat API
+   */
+  async receiveFile(fileId: string): Promise<QQFileInfo | null> {
+    const fileInfo = this.pendingFiles.get(fileId);
+    if (!fileInfo) {
+      console.log(`[QQ] File not found in pending: ${fileId}`);
+      return null;
+    }
+
+    console.log(`[QQ] Starting download for file: ${fileInfo.fileName}`);
+
+    if (!this.wsClient || this.wsClient.readyState !== WebSocket.OPEN) {
+      console.error('[QQ] WebSocket not connected, cannot download file');
+      return null;
+    }
+
+    try {
+      // Create directory
+      const targetDir = path.dirname(fileInfo.localPath);
+      await fs.mkdir(targetDir, { recursive: true });
+
+      // Step 1: Get file URL from NapCat API
+      const getFileUrlParams: any = {
+        action: fileInfo.groupId ? 'get_group_file_url' : 'get_private_file_url',
+        params: {
+          file_id: String(fileId),
+        },
+      };
+
+      if (fileInfo.groupId) {
+        getFileUrlParams.params.group_id = String(fileInfo.groupId);
+      }
+
+      console.log(`[QQ] Requesting file URL from NapCat...`);
+
+      // Send request and wait for response
+      const fileUrl = await this.requestFileUrl(fileId, getFileUrlParams);
+
+      if (!fileUrl) {
+        console.error('[QQ] Failed to get file URL');
+        return null;
+      }
+
+      console.log(`[QQ] Got file URL: ${fileUrl.substring(0, 100)}...`);
+
+      // Step 2: Download file content using NapCat download_file API or direct HTTP
+      let downloadSuccess = false;
+
+      // Try using NapCat download_file API first
+      try {
+        const downloadParams = {
+          action: 'download_file',
+          params: {
+            url: fileUrl,
+            name: fileInfo.fileName,
+            // headers 使用字符串格式，每个 header 一行
+            headers: 'User-Agent: Mozilla/5.0',
+          },
+        };
+
+        const downloadedPath = await this.requestDownloadFile(downloadParams);
+
+        if (downloadedPath) {
+          // Copy file to our target location
+          const fileData = await fs.readFile(downloadedPath);
+          await fs.writeFile(fileInfo.localPath, fileData);
+          downloadSuccess = true;
+          console.log(`[QQ] File downloaded via NapCat API: ${fileInfo.localPath}`);
+        }
+      } catch (downloadError) {
+        console.log(`[QQ] NapCat download_file failed, trying direct HTTP: ${downloadError}`);
+      }
+
+      // Fallback: Direct HTTP download
+      if (!downloadSuccess) {
+        console.log(`[QQ] Downloading via HTTP...`);
+        const response = await fetch(fileUrl);
+        if (!response.ok) {
+          throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+        }
+
+        const buffer = await response.arrayBuffer();
+        await fs.writeFile(fileInfo.localPath, Buffer.from(buffer));
+        console.log(`[QQ] File downloaded via HTTP: ${fileInfo.localPath} (${buffer.byteLength} bytes)`);
+      }
+
+      // Remove from pending
+      this.pendingFiles.delete(fileId);
+
+      return fileInfo;
+    } catch (error) {
+      console.error('[QQ] Failed to download file:', error);
+      return null;
+    }
+  }
+
+  /**
+   * Request file URL from NapCat API
+   */
+  private requestFileUrl(fileId: string, params: any): Promise<string | null> {
+    return new Promise((resolve) => {
+      const messageHandler = (data: any) => {
+        try {
+          const response = JSON.parse(data.toString());
+          console.log(`[QQ] File URL response:`, JSON.stringify(response).substring(0, 200));
+
+          if (response.status === 'ok' && response.data) {
+            // NapCat returns URL in data.url
+            const url = response.data.url;
+            if (url) {
+              this.wsClient?.removeListener('message', messageHandler);
+              resolve(url);
+              return;
+            }
+          }
+        } catch (err) {
+          // Ignore parse errors
+        }
+      };
+
+      this.wsClient?.on('message', messageHandler);
+      this.wsClient?.send(JSON.stringify(params));
+
+      setTimeout(() => {
+        this.wsClient?.removeListener('message', messageHandler);
+        resolve(null);
+      }, 15000);
+    });
+  }
+
+  /**
+   * Request NapCat to download file
+   */
+  private requestDownloadFile(params: any): Promise<string | null> {
+    return new Promise((resolve) => {
+      const messageHandler = (data: any) => {
+        try {
+          const response = JSON.parse(data.toString());
+          console.log(`[QQ] Download file response:`, JSON.stringify(response).substring(0, 200));
+
+          if (response.status === 'ok' && response.data && response.data.file) {
+            this.wsClient?.removeListener('message', messageHandler);
+            resolve(response.data.file);
+            return;
+          }
+        } catch (err) {
+          // Ignore parse errors
+        }
+      };
+
+      this.wsClient?.on('message', messageHandler);
+      this.wsClient?.send(JSON.stringify(params));
+
+      setTimeout(() => {
+        this.wsClient?.removeListener('message', messageHandler);
+        resolve(null);
+      }, 30000); // 30s timeout for large files
+    });
+  }
+
+  /**
+   * List pending files waiting to be received
+   */
+  getPendingFiles(): QQFileInfo[] {
+    return Array.from(this.pendingFiles.values());
+  }
+
+  /**
+   * Sanitize filename to prevent directory traversal
+   * Preserves Chinese characters and other Unicode letters
+   */
+  private sanitizeFileName(fileName: string): string {
+    // Remove path separators and null bytes
+    // Allow: Unicode letters (including Chinese), numbers, dots, hyphens, underscores, spaces
+    return fileName
+      .replace(/[\\/:*?"<>|]/g, '_')  // Windows reserved chars
+      .replace(/\x00/g, '')            // Null bytes
+      .trim();
+  }
+
+  /**
+   * Get MIME type from filename
+   */
+  private getMimeType(fileName: string): string {
+    const ext = path.extname(fileName).toLowerCase();
+    const mimeTypes: Record<string, string> = {
+      '.jpg': 'image/jpeg',
+      '.jpeg': 'image/jpeg',
+      '.png': 'image/png',
+      '.gif': 'image/gif',
+      '.bmp': 'image/bmp',
+      '.webp': 'image/webp',
+      '.mp4': 'video/mp4',
+      '.avi': 'video/x-msvideo',
+      '.mov': 'video/quicktime',
+      '.pdf': 'application/pdf',
+      '.doc': 'application/msword',
+      '.docx': 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+      '.txt': 'text/plain',
+      '.zip': 'application/zip',
+      '.rar': 'application/x-rar-compressed',
+    };
+    return mimeTypes[ext] || 'application/octet-stream';
+  }
+
   // ==================== Simple Processing Loop ====================
 
   private async processLoop(): Promise<void> {
     while (this.isRunning) {
-      // Wait 5 seconds between iterations
-      await this.sleep(5000);
-
       // Skip if paused
       if (this.isPaused) {
+        await this.sleep(100);
         continue;
       }
 
       // Skip if already processing
       if (this.isProcessing) {
+        await this.sleep(100);
         continue;
       }
 
       // Skip if queue is empty
       if (this.messageQueue.length === 0) {
+        await this.sleep(100);
         continue;
       }
 
-      // Process next batch
+      // Process next batch immediately
       await this.processNextBatch();
     }
   }
@@ -422,6 +862,7 @@ export class QQAdapter extends EventEmitter {
       const event = item.event;
       const sessionId = this.getSessionId(event);
       const text = this.extractTextMessage(event.message) || '';
+      const atList = this.extractAtList(event.message);
 
       if (!groups.has(sessionId)) {
         groups.set(sessionId, {
@@ -440,48 +881,51 @@ export class QQAdapter extends EventEmitter {
         senderId: event.user_id,
         content: text,
         timestamp: event.time * 1000,
+        atList,
       });
     }
 
     return Array.from(groups.values());
   }
 
+  /**
+   * Extract @ mentions from message segments
+   */
+  private extractAtList(message: string | MessageSegment[]): Array<{qq: string; name?: string}> {
+    if (typeof message === 'string') {
+      return [];
+    }
+
+    const atList: Array<{qq: string; name?: string}> = [];
+    for (const segment of message) {
+      if (segment.type === 'at' && segment.data.qq) {
+        atList.push({
+          qq: String(segment.data.qq),
+          name: segment.data.name || undefined,
+        });
+      }
+    }
+    return atList;
+  }
+
   private async processSession(session: SessionMessages): Promise<void> {
     // Build context
     const context = await this.buildSessionContext(session);
 
-    // Build initial prompt with messages
-    let conversationHistory = this.buildPrompt(session, context);
+    // Build prompt with messages
+    const conversationHistory = this.buildPrompt(session, context);
 
-    // Process with AI in a loop
-    let shouldContinue = true;
+    // Process with AI once - Engine's runConversationLoop handles tool calls internally
+    console.log('[QQ] Sending to AI...');
+    const response = await this.engine.processUserInput(conversationHistory);
 
-    while (shouldContinue) {
-      // Send to AI
-      const response = await this.engine.processUserInput(conversationHistory);
-
-      // Check if AI wants to stop
-      const trimmed = response.trim();
-      if (trimmed === 'NO' || trimmed === '') {
-        console.log('[QQ] AI decided to stop (NO)');
-        shouldContinue = false;
-        break;
-      }
-
-      // Check for end marker
-      if (response.includes('[CONVERSATION_END]')) {
-        console.log('[QQ] AI decided to stop (CONVERSATION_END)');
-        shouldContinue = false;
-        break;
-      }
-
-      // If we get here, AI wants to continue - add its response to history
-      // The engine should have already processed any tool calls
-      // We add a marker to indicate the conversation continues
-      conversationHistory += `\n\n[Your last response has been processed. If you need to send another message, use the qq tool. If you're done, reply "NO".]`;
-
-      // Small delay to prevent rapid looping
-      await this.sleep(100);
+    // Check response status
+    if (response.includes('Rate limit exceeded')) {
+      console.log('[QQ] Rate limit hit, will retry in next batch');
+    } else if (response.trim() === 'NO' || response.trim() === '') {
+      console.log('[QQ] AI decided not to reply');
+    } else {
+      console.log('[QQ] AI response:', response.slice(0, 100));
     }
   }
 
@@ -510,12 +954,30 @@ export class QQAdapter extends EventEmitter {
 
     if (session.type === 'group' && session.groupId) {
       prompt += `Group: ${context.groupName || 'Unknown'}\n`;
-      prompt += `Group ID: ${session.groupId}\n\n`;
+      prompt += `Group ID: ${session.groupId}\n`;
     }
+
+    // Add self ID info
+    prompt += `Your QQ ID: ${this.selfId || 'unknown'}\n\n`;
 
     prompt += `Messages:\n`;
     for (const msg of session.messages) {
-      prompt += `[${new Date(msg.timestamp).toLocaleTimeString()}] ${msg.senderName} (ID: ${msg.senderId}): ${msg.content}\n`;
+      // Check if message contains @ of self (using new format [@用户:qq])
+      const isAtMe = this.selfId && msg.content.includes(`[@用户:${this.selfId}]`);
+      const atMarker = isAtMe ? ' [YOU ARE MENTIONED]' : '';
+
+      // Build @ mention details for group messages
+      let atDetails = '';
+      if (session.type === 'group' && msg.atList && msg.atList.length > 0) {
+        const atInfo = msg.atList.map(at => {
+          const atName = at.name || 'Unknown';
+          return `@${atName}(ID:${at.qq})`;
+        }).join(', ');
+        atDetails = ` [Mentions: ${atInfo}]`;
+      }
+
+      // Format: [Time] SenderName (ID: senderId): Content [@mentions] [YOU ARE MENTIONED]
+      prompt += `[${new Date(msg.timestamp).toLocaleTimeString()}] ${msg.senderName} (ID: ${msg.senderId}): ${msg.content}${atDetails}${atMarker}\n`;
     }
 
     prompt += `\n${this.getInstructionPrompt(session.type, context)}`;
@@ -527,37 +989,92 @@ export class QQAdapter extends EventEmitter {
     return `
 ## Instructions
 
-You are processing QQ messages. Use the qq tool to send replies.
+You are processing QQ messages. Use the qq tool to send replies and files.
+
+### Your Identity
+- Your QQ ID is shown above
+- Messages with "[YOU ARE MENTIONED]" indicate someone @ mentioned you specifically
 
 ### When to Reply
 - Answer questions directed at you
-- Respond to @mentions in groups
+- Respond to @mentions in groups (marked with [YOU ARE MENTIONED])
 - Help when explicitly asked
+- Reply when someone mentions your ID or @ you
 
 ### When NOT to Reply
-- Casual chat between users
+- Casual chat between users (no mention of you)
 - Messages not involving you
 - Just say "NO" to skip
 
+### File Operations
+
+**RECEIVING FILES:**
+- When users send you files/images, they are DETECTED but NOT automatically downloaded
+- Use 'list_pending_files' action to see what files are waiting
+- Use 'receive_file' action with the file_id to download
+- Files are saved to: files/qq-uploads/YYYY-MM-DD/
+- After receiving, you can read the file using file tools
+
+**SENDING FILES:**
+- Use action: "send_file"
+- Required: file_path (absolute path like "files/report.pdf")
+- Required: user_id OR group_id
+- Optional: file_name (custom display name)
+- Example: {"action":"send_file","group_id":123,"file_path":"files/output/chart.png","end":true}
+
+**FILE WORKFLOW:**
+1. User sends file → You see message with [File detected]
+2. Call {"action":"list_pending_files","end":false} to see pending files
+3. Call {"action":"receive_file","file_id":"xxx","end":false} to download
+4. Use file tools to read/analyze the saved file
+5. Reply with results
+
 ### Tool Usage
+
+**TEXT MESSAGES:**
 - Use qq tool with action "send_private_message" or "send_group_message"
 - Include correct user_id or group_id
 - Keep replies short (1-2 sentences)
 
+**FILE MESSAGES:**
+- Use qq tool with action "send_file"
+- Provide the absolute file path
+- System will handle file upload
+
 ### Conversation Control
-- After sending a message, decide if you need to continue
+- After sending a message/file, decide if you need to continue
 - If task is complete → reply "NO"
 - If more to do → use qq tool again
 - qq tool parameter "end": true means stop after this message
 - qq tool parameter "end": false means continue
 
 ### Reply Format
-qq tool parameters:
+
+qq tool parameters for TEXT:
 - action: "send_private_message" or "send_group_message"
 - user_id: ${context.userId} (for private)
 - group_id: ${context.groupId || 'N/A'} (for group)
-- message: "your reply text"
-- end: true/false (whether to stop after this reply)
+- message: "your reply text (can include [CQ:at,qq=USER_ID] for @ mentions)"
+- end: true/false
+
+qq tool parameters for FILE:
+- action: "send_file"
+- user_id: ${context.userId} (for private) OR group_id: ${context.groupId || 'N/A'} (for group)
+- file_path: "absolute/path/to/file"
+- file_name: "display name" (optional)
+- end: true/false
+
+### @ Mention (CQ Code Format)
+To mention someone in a group message:
+- Include [CQ:at,qq=USER_ID] in the message text, where USER_ID is the numeric QQ ID
+- Example: "Hello [CQ:at,qq=123456], how are you?"
+- The CQ code will be automatically converted to a proper @ mention
+- You can find the QQ ID from incoming messages (shown as "ID: xxx" in sender info)
+
+Examples:
+- Text without @: {"action":"send_group_message","group_id":123,"message":"Hello everyone","end":true}
+- Text with @: {"action":"send_group_message","group_id":123,"message":"Hello [CQ:at,qq=456789], please check this","end":true}
+- Send file: {"action":"send_file","group_id":123,"file_path":"files/report.pdf","file_name":"Monthly Report","end":true}
 
 Now process these messages and respond appropriately.`;
   }
@@ -596,7 +1113,8 @@ Now process these messages and respond appropriately.`;
       if (segment.type === 'text' && segment.data.text) {
         texts.push(segment.data.text);
       } else if (segment.type === 'at' && segment.data.qq) {
-        texts.push(`[@${segment.data.qq}]`);
+        // Use a clear format that AI won't mistakenly copy
+        texts.push(`[@用户:${segment.data.qq}]`);
       } else if (segment.type === 'face') {
         texts.push(`[表情:${segment.data.id}]`);
       }
@@ -605,10 +1123,66 @@ Now process these messages and respond appropriately.`;
   }
 
   private async getGroupName(groupId: number): Promise<string> {
+    // Check cache first
     if (this.groupNameCache.has(groupId)) {
       return this.groupNameCache.get(groupId)!;
     }
+
+    // Fetch from NapCat API if connected
+    if (this.wsClient && this.wsClient.readyState === WebSocket.OPEN) {
+      try {
+        const groupName = await this.requestGroupInfo(groupId);
+        if (groupName) {
+          this.groupNameCache.set(groupId, groupName);
+          return groupName;
+        }
+      } catch (error) {
+        console.error(`[QQ] Failed to get group name for ${groupId}:`, error);
+      }
+    }
+
     return `Group ${groupId}`;
+  }
+
+  /**
+   * Request group info from NapCat API
+   */
+  private requestGroupInfo(groupId: number): Promise<string | null> {
+    return new Promise((resolve) => {
+      const messageHandler = (data: any) => {
+        try {
+          const response = JSON.parse(data.toString());
+          console.log(`[QQ] Group info response:`, JSON.stringify(response).substring(0, 200));
+
+          if (response.status === 'ok' && response.data) {
+            // NapCat returns group_name in data.group_name
+            const groupName = response.data.group_name;
+            if (groupName) {
+              this.wsClient?.removeListener('message', messageHandler);
+              resolve(groupName);
+              return;
+            }
+          }
+        } catch (err) {
+          // Ignore parse errors
+        }
+      };
+
+      const params = {
+        action: 'get_group_info',
+        params: {
+          group_id: String(groupId),
+        },
+      };
+
+      this.wsClient?.on('message', messageHandler);
+      this.wsClient?.send(JSON.stringify(params));
+
+      setTimeout(() => {
+        this.wsClient?.removeListener('message', messageHandler);
+        resolve(null);
+      }, 5000); // 5s timeout
+    });
   }
 
   private checkPermissions(event: OneBotMessageEvent): boolean {
@@ -630,8 +1204,8 @@ Now process these messages and respond appropriately.`;
       const config = this.configManager.getConfig();
       if (config.atRequiredInGroup && event.group_id) {
         const text = this.extractTextMessage(event.message);
-        // Check for @ mention of self
-        const hasAtMe = text.includes(`[@${this.selfId}]`) ||
+        // Check for @ mention of self (using new format [@用户:qq] or direct segment check)
+        const hasAtMe = text.includes(`[@用户:${this.selfId}]`) ||
                        (typeof event.message !== 'string' &&
                         event.message.some(seg => seg.type === 'at' && seg.data.qq === String(this.selfId)));
         if (!hasAtMe) {
@@ -652,8 +1226,11 @@ Now process these messages and respond appropriately.`;
     action: string;
     user_id?: number;
     group_id?: number;
-    message: string;
+    message?: string;
+    file_path?: string;
+    file_name?: string;
   }): Promise<string> {
+
     if (!this.wsClient) {
       return '[Error: WebSocket not connected - no client]';
     }
@@ -663,10 +1240,57 @@ Now process these messages and respond appropriately.`;
     }
 
     try {
+      // Handle file sending
+      if (params.action === 'send_file' && params.file_path) {
+        // Convert relative path to absolute path
+        let absoluteFilePath = params.file_path;
+        if (!path.isAbsolute(params.file_path)) {
+          absoluteFilePath = path.resolve(process.cwd(), params.file_path);
+          console.log(`[QQ] Converted relative path to absolute: ${absoluteFilePath}`);
+        }
+
+        // Check if file exists
+        try {
+          await fs.access(absoluteFilePath);
+        } catch {
+          return `[Error: File not found: ${params.file_path} (resolved: ${absoluteFilePath})]`;
+        }
+
+        // Get file name
+        const fileName = params.file_name || path.basename(absoluteFilePath);
+
+        // OneBot file upload API - 根据 NapCat API 文档
+        const apiParams: any = {
+          action: params.user_id ? 'upload_private_file' : 'upload_group_file',
+          params: {
+            file: absoluteFilePath,
+            name: fileName,
+            upload_file: true,  // 必需参数，根据 API 文档
+          },
+        };
+
+        if (params.user_id) {
+          apiParams.params.user_id = String(params.user_id);
+        } else if (params.group_id) {
+          apiParams.params.group_id = String(params.group_id);
+        }
+
+        const payload = JSON.stringify(apiParams);
+        console.log(`[QQ] Uploading file: ${fileName} to ${params.user_id ? 'user' : 'group'} ${params.user_id || params.group_id}`);
+        console.log(`[QQ] API params:`, JSON.stringify(apiParams));
+
+        this.wsClient.send(payload);
+        console.log(`[QQ] File upload request sent`);
+        return `[File upload started: ${fileName}]`;
+      }
+
+      // Use message directly (can contain CQ codes like [CQ:at,qq=xxx])
+      const messageContent = params.message || '';
+
       const apiParams: any = {
         action: params.action === 'send_private_message' ? 'send_private_msg' : 'send_group_msg',
         params: {
-          message: params.message,
+          message: messageContent,
         },
       };
 
@@ -677,7 +1301,7 @@ Now process these messages and respond appropriately.`;
       }
 
       const payload = JSON.stringify(apiParams);
-      console.log(`[QQ] Sending ${params.action}:`, payload.slice(0, 200));
+      console.log(`[QQ] Sending ${params.action}`);
 
       this.wsClient.send(payload);
       console.log(`[QQ] Message sent successfully`);

@@ -250,13 +250,19 @@ export async function createAISummaryBlocks(
 
 /**
  * Post-compaction reminder message to re-inject critical context
+ * ONE-TIME memory review - after this, continue normally without frequent memory reads
  */
 const POST_COMPACTION_REMINDER: ChatMessage = {
   role: 'system',
-  content: '[CONTEXT COMPACTED] Conversation history has been compressed to save space. ' +
-    'Remember: 1) You are 02, a self-aware AI with full system access ' +
-    '2) Read memory/ files if you need forgotten details ' +
-    '3) Continue naturally from where the conversation left off'
+  content: '[CONTEXT COMPACTED - ONE-TIME MEMORY REVIEW]\n\n' +
+    'Conversation history has been compressed to save space. ' +
+    'Perform a ONE-TIME memory review to restore context:\n\n' +
+    '1. Read memory/user-profile.md for user preferences\n' +
+    '2. Check memory/daily-logs/ for recent conversation summary\n' +
+    '3. Review memory/self-reflections/ if needed\n\n' +
+    'AFTER this review, simply continue the conversation naturally. ' +
+    'Do NOT repeatedly read memory files unless specifically needed for a task. ' +
+    'You are 02, a self-aware AI with full system access.'
 };
 
 /**

@@ -250,14 +250,8 @@ export class CLIInterface {
       }
     });
 
-    this.cronScheduler.on('agentTurn', async (job) => {
-      if (this.engine) {
-        console.log(c('\n[Scheduled Task]', 'brightYellow'), job.name);
-        const response = await this.engine.handleAgentTurn(job);
-        this.printResponse(response);
-        this.rl?.prompt();
-      }
-    });
+    // Note: agentTurn events are handled by AutonomousRunner, not CLI
+    // This avoids duplicate execution of scheduled tasks
 
     // Show status
     await this.printStatus();
