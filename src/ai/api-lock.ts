@@ -1,46 +1,57 @@
 /**
- * API Call Lock
- * Ensures single-threaded API calls across the entire application
- * Prevents parallel API calls that could cause rate limiting issues
+ * API Call Limiter
+ * Controls concurrency of upstream AI API calls.
+ *
+ * NOTE:
+ * - Previously this was a strict global mutex (single-thread).
+ * - Now it is a semaphore so multiple sessions can call the API concurrently,
+ *   while still capping overall concurrency to reduce rate-limit pressure.
  */
 
 class APICallLock {
-  private currentLock: Promise<void> = Promise.resolve();
-  private isLocked: boolean = false;
+  private readonly maxConcurrent: number;
+  private active: number = 0;
+  private waiters: Array<() => void> = [];
+
+  constructor(maxConcurrent: number = 1) {
+    // Safety clamp
+    const n = Number.isFinite(maxConcurrent) ? Math.floor(maxConcurrent) : 1;
+    this.maxConcurrent = Math.max(1, n);
+  }
 
   /**
-   * Acquire the API call lock
-   * Waits if another call is in progress
+   * Acquire one concurrency slot.
    */
   async acquire(): Promise<() => void> {
-    // Wait for current lock to release
-    while (this.isLocked) {
-      await this.currentLock;
+    if (this.active < this.maxConcurrent) {
+      this.active++;
+      return () => this.release();
     }
 
-    // Acquire lock
-    this.isLocked = true;
-    let release: () => void;
-    this.currentLock = new Promise<void>((resolve) => {
-      release = () => {
-        this.isLocked = false;
-        resolve();
-      };
+    await new Promise<void>((resolve) => {
+      this.waiters.push(resolve);
     });
 
-    return release!;
+    // Woken up -> take slot
+    this.active++;
+    return () => this.release();
+  }
+
+  private release(): void {
+    this.active = Math.max(0, this.active - 1);
+    const next = this.waiters.shift();
+    if (next) next();
   }
 
   /**
-   * Check if an API call is currently in progress
+   * Check if any API call is currently in progress
    */
   isInProgress(): boolean {
-    return this.isLocked;
+    return this.active > 0;
   }
 
   /**
-   * Execute a function with the API lock
-   * Automatically acquires and releases the lock
+   * Execute a function with concurrency limiting.
    */
   async withLock<T>(fn: () => Promise<T>): Promise<T> {
     const release = await this.acquire();
@@ -53,4 +64,5 @@ class APICallLock {
 }
 
 // Global singleton instance
-export const globalApiLock = new APICallLock();
+// Default concurrency = 3 (tunable via AI_MAX_CONCURRENT)
+export const globalApiLock = new APICallLock(parseInt(process.env.AI_MAX_CONCURRENT || '3', 10));

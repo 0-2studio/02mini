@@ -9,6 +9,7 @@ import fs from 'fs/promises';
 import path from 'path';
 import type { CoreEngine } from '../core/engine.js';
 import { stripMessageMarker } from '../core/engine.js';
+import { Semaphore } from '../ai/semaphore.js';
 import type { QQConfigManager } from './config.js';
 import type {
   OneBotMessageEvent,
@@ -55,6 +56,9 @@ export class QQAdapter extends EventEmitter {
   private configManager: QQConfigManager;
   private workingDir: string;
 
+  // Concurrency limiter for parallel session processing
+  private sessionSemaphore: Semaphore;
+
   private wsServer?: WebSocket.Server;
   private wsClient?: WebSocket;
   private sessions: Map<string, QQSession> = new Map();
@@ -94,6 +98,10 @@ export class QQAdapter extends EventEmitter {
     this.configManager = options.configManager;
     this.workingDir = options.workingDir;
     this.fileUploadDir = path.join(this.workingDir, 'files', 'qq-uploads');
+
+    const maxParallel = parseInt(process.env.QQ_MAX_PARALLEL_SESSIONS || '3', 10);
+    this.sessionSemaphore = new Semaphore(Number.isFinite(maxParallel) ? maxParallel : 3);
+
     this.ensureFileUploadDir();
   }
 
@@ -462,12 +470,20 @@ export class QQAdapter extends EventEmitter {
       return;
     }
 
-    // Check for file/image messages and store info (but don't download yet)
+    // Detect files/images first (store pending info even if we decide not to reply)
     const fileInfo = await this.detectFileMessage(event);
     if (fileInfo) {
       console.log(`[QQ] File detected: ${fileInfo.fileName} (${fileInfo.fileSize} bytes) - use receive_file tool to download`);
-      // Store file info for later retrieval
       this.pendingFiles.set(fileInfo.fileId, fileInfo);
+    }
+
+    // Group chat load-shedding: if not @ me and not a direct question, don't enqueue
+    if (event.message_type === 'group') {
+      const atMe = this.isAtMe(event, text);
+      const directQuestion = this.looksLikeDirectQuestion(text || '');
+      if (!atMe && !directQuestion) {
+        return;
+      }
     }
 
     // Add to queue
@@ -478,6 +494,41 @@ export class QQAdapter extends EventEmitter {
     });
 
     console.log(`[QQ] Queued message from ${event.user_id}: ${text?.slice(0, 30) || '(empty)'}`);
+  }
+
+  /**
+   * Whether this message @mentioned me.
+   */
+  private isAtMe(event: OneBotMessageEvent, extractedText?: string): boolean {
+    if (!this.selfId) return false;
+
+    // Fast path: extracted text uses [@用户:qq]
+    const text = extractedText ?? this.extractTextMessage(event.message);
+    if (text && text.includes(`[@用户:${this.selfId}]`)) return true;
+
+    // Segment path
+    if (typeof event.message !== 'string') {
+      return event.message.some(seg => seg.type === 'at' && String(seg.data?.qq) === String(this.selfId));
+    }
+
+    return false;
+  }
+
+  /**
+   * Heuristic: treat as a direct question worth replying in group.
+   * (Keeps load low; goal is faster replies when actually needed.)
+   */
+  private looksLikeDirectQuestion(text: string): boolean {
+    const t = (text || '').trim();
+    if (!t) return false;
+
+    // Must look like a question
+    const hasQ = t.includes('?') || t.includes('？');
+    if (!hasQ) return false;
+
+    // Require some addressing/intent keywords to avoid reacting to random “？” spam
+    const keywords = ['02', '你', '怎么', '为啥', '为什么', '咋', '求', '帮', '能不能', '可以吗', '有没有'];
+    return keywords.some(k => t.includes(k));
   }
 
   /**
@@ -820,7 +871,14 @@ export class QQAdapter extends EventEmitter {
         continue;
       }
 
-      // Process next batch immediately
+      // Optional: small delay to accumulate rapid-fire messages into one batch
+      const cfg = this.configManager.getConfig();
+      const delay = cfg.accumulationDelay ?? 0;
+      if (delay > 0) {
+        await this.sleep(delay);
+      }
+
+      // Process next batch
       await this.processNextBatch();
     }
   }
@@ -836,15 +894,34 @@ export class QQAdapter extends EventEmitter {
 
     try {
       // Group messages by session
-      const sessionGroups = this.groupMessagesBySession(this.messageQueue);
+      let sessionGroups = this.groupMessagesBySession(this.messageQueue);
 
       // Clear processed messages from queue
       this.messageQueue = [];
 
+      // Prioritize: private > group @me > others
+      sessionGroups = sessionGroups.sort((a, b) => {
+        const aPri = this.getSessionPriority(a);
+        const bPri = this.getSessionPriority(b);
+        return bPri - aPri;
+      });
+
+      const cfg = this.configManager.getConfig();
+
       // Process each session
-      for (const session of sessionGroups) {
-        console.log(`[QQ] Processing session ${session.sessionId} with ${session.messages.length} message(s)`);
-        await this.processSession(session);
+      if (cfg.parallelProcessing) {
+        console.log(`[QQ] Parallel session processing enabled (max=${process.env.QQ_MAX_PARALLEL_SESSIONS || '3'})`);
+        await Promise.all(sessionGroups.map((session) =>
+          this.sessionSemaphore.withPermit(async () => {
+            console.log(`[QQ] Processing session ${session.sessionId} with ${session.messages.length} message(s)`);
+            await this.processSession(session);
+          })
+        ));
+      } else {
+        for (const session of sessionGroups) {
+          console.log(`[QQ] Processing session ${session.sessionId} with ${session.messages.length} message(s)`);
+          await this.processSession(session);
+        }
       }
 
       console.log('[QQ] Batch processing complete');
@@ -853,6 +930,21 @@ export class QQAdapter extends EventEmitter {
     } finally {
       this.isProcessing = false;
     }
+  }
+
+  private getSessionPriority(session: SessionMessages): number {
+    // Higher = earlier
+    if (session.type === 'private') return 100;
+
+    // Group: if any message @me, boost
+    if (this.selfId) {
+      const atMarker = `[@用户:${this.selfId}]`;
+      if (session.messages.some(m => m.content.includes(atMarker))) {
+        return 50;
+      }
+    }
+
+    return 0;
   }
 
   private groupMessagesBySession(queue: QueueItem[]): SessionMessages[] {
@@ -915,8 +1007,9 @@ export class QQAdapter extends EventEmitter {
     // Build prompt with messages
     const conversationHistory = this.buildPrompt(session, context);
 
-    // Process with AI once - Engine's runConversationLoop handles tool calls internally
-    console.log('[QQ] Sending to AI...');
+    // Use the main engine with shared context
+    // All sessions share the same messages array for cross-session memory
+    console.log('[QQ] Sending to AI with SHARED context...');
     const response = await this.engine.processUserInput(conversationHistory);
 
     // Check response status

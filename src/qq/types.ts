@@ -167,7 +167,7 @@ export const DEFAULT_QQ_CONFIG: QQConfig = {
   typingIndicator: false,
   // Session processing defaults
   parallelProcessing: true,   // Process sessions in parallel by default
-  accumulationDelay: 200,     // 200ms delay for message accumulation
+  accumulationDelay: 400,     // 400ms delay for message accumulation (reduce spam, improve batching)
 };
 
 /** Simple message queue item */

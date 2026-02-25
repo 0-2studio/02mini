@@ -15,6 +15,7 @@ import {
 } from './tokens.js';
 import { incrementalCompaction, compactContext, extractKeyFacts } from './compaction.js';
 import type { AIClient } from '../ai/client.js';
+import { globalCompactionLock } from '../ai/compaction-lock.js';
 
 export interface ContextManagerOptions {
   maxTokens?: number;
@@ -62,7 +63,8 @@ export class ContextManager {
 
   /**
    * Check if compaction is needed and perform it
-   * CRITICAL: This method ensures atomic compaction - only one at a time
+   * CRITICAL: This method uses globalCompactionLock to ensure single-threaded compaction
+   * across ALL engine instances (shared context)
    */
   async checkAndCompact(
     messages: ChatMessage[],
@@ -75,13 +77,6 @@ export class ContextManager {
     compacted: boolean;
     report?: CompressionReport;
   }> {
-    // If already compacting, wait for it to complete and return
-    if (this.isCompacting || this.isProcessingCompaction) {
-      await this.waitForCompaction();
-      // After waiting, return without compacting (someone else just did it)
-      return { messages, compacted: false };
-    }
-
     // Don't compact if disabled
     if (!this.enableAutoCompaction && !options.forceLevel) {
       return { messages, compacted: false };
@@ -98,7 +93,7 @@ export class ContextManager {
       return { messages, compacted: false };
     }
 
-    // Determine compaction level
+    // Determine compaction level BEFORE acquiring lock
     let level: CompactionLevel;
     if (options.forceLevel) {
       level = options.forceLevel;
@@ -110,61 +105,68 @@ export class ContextManager {
       level = check.level;
     }
 
-    // ATOMIC: Set flags immediately to prevent other concurrent compactions
-    this.isProcessingCompaction = true;
-    this.isCompacting = true;
+    // ACQUIRE GLOBAL LOCK - blocks all other operations during compaction
+    return await globalCompactionLock.withLock(async () => {
+      console.log('[Context] Global compaction lock acquired - other operations will wait');
 
-    try {
-      // Perform compaction (pass AI client for intelligent summarization)
-      const result = await incrementalCompaction(messages, this.maxTokens, this.aiClient);
+      // Set internal flags for consistency
+      this.isProcessingCompaction = true;
+      this.isCompacting = true;
 
-      // If compaction didn't help much, return original
-      if (result.compressedTokens >= result.originalTokens * 0.95) {
-        return { messages, compacted: false };
+      try {
+        // Perform compaction (pass AI client for intelligent summarization)
+        const result = await incrementalCompaction(messages, this.maxTokens, this.aiClient);
+
+        // If compaction didn't help much, return original
+        if (result.compressedTokens >= result.originalTokens * 0.95) {
+          return { messages, compacted: false };
+        }
+
+        // Update state
+        this.lastCompactionTime = now;
+
+        // Build report
+        const report: CompressionReport = {
+          timestamp: now,
+          level: result.level,
+          originalMessages: result.originalMessages,
+          compressedMessages: result.compressedMessages,
+          originalTokens: result.originalTokens,
+          compressedTokens: result.compressedTokens,
+          savedTokens: result.originalTokens - result.compressedTokens,
+          savedPercentage: ((result.originalTokens - result.compressedTokens) / result.originalTokens) * 100,
+        };
+
+        this.compressionHistory.push(report);
+
+        // Keep only last 20 reports
+        if (this.compressionHistory.length > 20) {
+          this.compressionHistory = this.compressionHistory.slice(-20);
+        }
+
+        // Log if not silent
+        if (!options.silent) {
+          console.log(
+            `[Context] Compacted ${report.originalMessages}→${report.compressedMessages} messages ` +
+            `(${formatTokenCount(report.originalTokens)}→${formatTokenCount(report.compressedTokens)} tokens, ` +
+            `-${report.savedPercentage.toFixed(1)}%)`
+          );
+        }
+
+        return {
+          messages: result.removedIndices.length > 0
+            ? this.rebuildMessages(messages, result)
+            : messages,
+          compacted: true,
+          report,
+        };
+      } finally {
+        // Reset internal flags
+        this.isCompacting = false;
+        this.isProcessingCompaction = false;
+        console.log('[Context] Global compaction lock released');
       }
-
-      // Update state
-      this.lastCompactionTime = now;
-
-      // Build report
-      const report: CompressionReport = {
-        timestamp: now,
-        level: result.level,
-        originalMessages: result.originalMessages,
-        compressedMessages: result.compressedMessages,
-        originalTokens: result.originalTokens,
-        compressedTokens: result.compressedTokens,
-        savedTokens: result.originalTokens - result.compressedTokens,
-        savedPercentage: ((result.originalTokens - result.compressedTokens) / result.originalTokens) * 100,
-      };
-
-      this.compressionHistory.push(report);
-
-      // Keep only last 20 reports
-      if (this.compressionHistory.length > 20) {
-        this.compressionHistory = this.compressionHistory.slice(-20);
-      }
-
-      // Log if not silent
-      if (!options.silent) {
-        console.log(
-          `[Context] Compacted ${report.originalMessages}→${report.compressedMessages} messages ` +
-          `(${formatTokenCount(report.originalTokens)}→${formatTokenCount(report.compressedTokens)} tokens, ` +
-          `-${report.savedPercentage.toFixed(1)}%)`
-        );
-      }
-
-      return {
-        messages: result.removedIndices.length > 0
-          ? this.rebuildMessages(messages, result)
-          : messages,
-        compacted: true,
-        report,
-      };
-    } finally {
-      // CRITICAL: Always end compaction - unblock waiting operations
-      this.endCompaction();
-    }
+    });
   }
   
   /**

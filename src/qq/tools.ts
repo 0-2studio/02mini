@@ -57,12 +57,20 @@ LIST PENDING FILES:
 - You can find the QQ ID from incoming messages (shown as "ID: xxx" in the sender info)
 
 END PARAMETER:
-- end=true (default): Stop conversation after this action
-- end=false: Continue for more actions
+- end=false: Continue for more actions (e.g., send message → read file → send another)
+- end=true: Stop conversation after this action
+- DEFAULT (omitted): Conversation continues - you can make more tool calls
+- IMPORTANT: If you only need to send ONE message and are done, use end=true to stop
+
+HOW TO END CONVERSATION AFTER SENDING MESSAGE:
+- Option 1: Use end=true in the qq tool call → stops immediately
+- Option 2: After sending, reply "NO" → stops conversation
+- Option 3: Call the "stop" tool → stops conversation
+- DO NOT send multiple messages to the same user for the same question
 
 EXAMPLES:
-Private message: {"action":"send_private_message","user_id":123456,"message":"Hello","end":true}
-Group message: {"action":"send_group_message","group_id":789,"message":"Hello everyone","end":true}
+Private message (then stop): {"action":"send_private_message","user_id":123456,"message":"Hello","end":true}
+Group message (then stop): {"action":"send_group_message","group_id":789,"message":"Hello everyone","end":true}
 With @ mention: {"action":"send_group_message","group_id":789,"message":"Hello [CQ:at,qq=456], how are you?","end":true}
 Send file to group: {"action":"send_file","group_id":789,"file_path":"files/report.pdf","end":true}
 Send file to user: {"action":"send_file","user_id":123456,"file_path":"files/report.pdf","end":true}
