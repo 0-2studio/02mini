@@ -1055,16 +1055,10 @@ export class CoreEngine {
         resultText = result.content?.[0]?.text || 'Success';
       }
 
-      // Truncate long tool results to prevent context overflow
-      const maxToolResultLength = 24000; // ~6000 tokens at 4 chars/token
+      // Log warning for very long results (but don't truncate)
+      const maxToolResultLength = 24000;
       if (resultText.length > maxToolResultLength) {
-        const headChars = Math.floor(maxToolResultLength * 0.3);
-        const tailChars = Math.floor(maxToolResultLength * 0.3);
-        const head = resultText.slice(0, headChars);
-        const tail = resultText.slice(-tailChars);
-        const omitted = resultText.length - headChars - tailChars;
-        resultText = `${head}\n\n[...${omitted} characters omitted...]\n\n${tail}`;
-        console.log(`[Engine] Tool result truncated: ${resultText.length} chars (was ${resultText.length + omitted})`);
+        console.log(`[Engine] Warning: Tool result is very long (${resultText.length} chars), may affect context window`);
       }
 
       console.log(`[Engine] Tool result: ${resultText.slice(0, 100)}...`);

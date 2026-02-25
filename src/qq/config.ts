@@ -120,8 +120,22 @@ export class QQConfigManager {
       hasEnvConfig = true;
     }
 
+    if (env.QQ_PARALLEL_PROCESSING !== undefined) {
+      this.config.parallelProcessing = env.QQ_PARALLEL_PROCESSING === 'true';
+      hasEnvConfig = true;
+    }
+
+    if (env.QQ_ACCUMULATION_DELAY) {
+      const delay = parseInt(env.QQ_ACCUMULATION_DELAY, 10);
+      if (!isNaN(delay) && delay >= 0) {
+        this.config.accumulationDelay = delay;
+        hasEnvConfig = true;
+      }
+    }
+
     if (hasEnvConfig) {
       console.log('[QQ] Configuration overridden from environment variables');
+      console.log(`[QQ] parallelProcessing: ${this.config.parallelProcessing}, accumulationDelay: ${this.config.accumulationDelay}ms`);
     }
   }
 

@@ -56,9 +56,13 @@ export class ContextManager {
     this.aiClient = options.aiClient;
   }
   
+  // Queue for pending compaction requests
+  private compactionQueue: (() => void)[] = [];
+  private isProcessingCompaction = false;
+
   /**
    * Check if compaction is needed and perform it
-   * CRITICAL: This method blocks other operations during compaction
+   * CRITICAL: This method ensures atomic compaction - only one at a time
    */
   async checkAndCompact(
     messages: ChatMessage[],
@@ -71,6 +75,13 @@ export class ContextManager {
     compacted: boolean;
     report?: CompressionReport;
   }> {
+    // If already compacting, wait for it to complete and return
+    if (this.isCompacting || this.isProcessingCompaction) {
+      await this.waitForCompaction();
+      // After waiting, return without compacting (someone else just did it)
+      return { messages, compacted: false };
+    }
+
     // Don't compact if disabled
     if (!this.enableAutoCompaction && !options.forceLevel) {
       return { messages, compacted: false };
@@ -99,8 +110,9 @@ export class ContextManager {
       level = check.level;
     }
 
-    // CRITICAL: Start compaction - block other operations
-    this.startCompaction();
+    // ATOMIC: Set flags immediately to prevent other concurrent compactions
+    this.isProcessingCompaction = true;
+    this.isCompacting = true;
 
     try {
       // Perform compaction (pass AI client for intelligent summarization)
@@ -313,7 +325,9 @@ export class ContextManager {
    * End compaction - unblock waiting operations
    */
   private endCompaction(): void {
+    // Reset all flags atomically
     this.isCompacting = false;
+    this.isProcessingCompaction = false;
     console.log('[Context] Compaction completed - unblocking operations');
 
     // Resolve all waiting promises

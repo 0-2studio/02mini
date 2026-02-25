@@ -19,20 +19,25 @@ export function createQQTools(adapter: QQAdapter, _configManager: QQConfigManage
       description: `Send/receive messages and files to/from QQ users or groups.
 
 ACTIONS:
-- send_private_message: Send DM to a QQ user
-- send_group_message: Send message to a QQ group
-- send_file: Send a file (document, image, video, etc.) to user or group
+- send_private_message: Send DM to a QQ user (requires user_id, NOT group_id)
+- send_group_message: Send message to a QQ group (requires group_id, NOT user_id)
+- send_file: Send a file to user or group
 - receive_file: Download a received file to files/qq-uploads/
 - list_pending_files: List files waiting to be received
 
+IMPORTANT - ID PARAMETERS:
+- send_private_message: ONLY use user_id, do NOT include group_id
+- send_group_message: ONLY use group_id, do NOT include user_id
+- user_id and group_id are MUTUALLY EXCLUSIVE
+
 TEXT MESSAGES:
 - action: "send_private_message" | "send_group_message"
-- user_id or group_id
-- message: Text content (can include CQ codes for @ mentions, see below)
+- user_id (for private) OR group_id (for group) - NOT both
+- message: Text content (can include CQ codes for @ mentions)
 
 SEND FILE:
 - action: "send_file"
-- user_id or group_id
+- user_id (for private) OR group_id (for group)
 - file_path: Absolute path to file
 - file_name: Optional display name
 
@@ -50,17 +55,17 @@ LIST PENDING FILES:
 - Example: "Hello [CQ:at,qq=123456], how are you?"
 - The number after qq= MUST be the numeric QQ ID, not the nickname
 - You can find the QQ ID from incoming messages (shown as "ID: xxx" in the sender info)
-- This format is automatically converted to QQ's native @ mention
 
 END PARAMETER:
-- end=true (default): Stop conversation
+- end=true (default): Stop conversation after this action
 - end=false: Continue for more actions
 
 EXAMPLES:
-Send text: {"action":"send_group_message","group_id":123,"message":"Hello everyone","end":true}
-With @ mention: {"action":"send_group_message","group_id":123,"message":"Hello [CQ:at,qq=456789], how are you?","end":true}
-  - Note: 456789 is the QQ user ID you want to @
-Send file: {"action":"send_file","group_id":123,"file_path":"files/report.pdf","end":true}
+Private message: {"action":"send_private_message","user_id":123456,"message":"Hello","end":true}
+Group message: {"action":"send_group_message","group_id":789,"message":"Hello everyone","end":true}
+With @ mention: {"action":"send_group_message","group_id":789,"message":"Hello [CQ:at,qq=456], how are you?","end":true}
+Send file to group: {"action":"send_file","group_id":789,"file_path":"files/report.pdf","end":true}
+Send file to user: {"action":"send_file","user_id":123456,"file_path":"files/report.pdf","end":true}
 Receive file: {"action":"receive_file","file_id":"abc123","end":true}
 List files: {"action":"list_pending_files","end":false}`,
       parameters: {
@@ -107,6 +112,77 @@ List files: {"action":"list_pending_files","end":false}`,
   };
 }
 
+// Validation helper function
+function validateQQParams(params: {
+  action: string;
+  user_id?: number;
+  group_id?: number;
+  message?: string;
+  file_path?: string;
+  file_id?: string;
+}): { valid: boolean; error?: string; help?: string } {
+  // Check for missing user_id for private message
+  if (params.action === 'send_private_message' && !params.user_id) {
+    return {
+      valid: false,
+      error: 'Missing user_id for send_private_message',
+      help: `CORRECT USAGE: {"action":"send_private_message","user_id":123456,"message":"Hello","end":true}
+Note: For private messages, only user_id is required. Do NOT include group_id.`
+    };
+  }
+
+  // Check for missing or invalid group_id for group message
+  if (params.action === 'send_group_message') {
+    if (!params.group_id) {
+      return {
+        valid: false,
+        error: 'Missing group_id for send_group_message',
+        help: `CORRECT USAGE: {"action":"send_group_message","group_id":123456,"message":"Hello","end":true}`
+      };
+    }
+    if (params.group_id === 0) {
+      return {
+        valid: false,
+        error: 'Invalid group_id: 0. group_id must be a valid positive number (> 0)',
+        help: `CORRECT USAGE: {"action":"send_group_message","group_id":123456,"message":"Hello","end":true}
+Note: group_id must be a positive number, not 0`
+      };
+    }
+  }
+
+  // Check for send_file - needs either user_id OR group_id
+  if (params.action === 'send_file') {
+    if (!params.user_id && !params.group_id) {
+      return {
+        valid: false,
+        error: 'Missing user_id or group_id for send_file',
+        help: `CORRECT USAGE: {"action":"send_file","group_id":123456,"file_path":"files/report.pdf","end":true} OR {"action":"send_file","user_id":123456,"file_path":"files/report.pdf","end":true}`
+      };
+    }
+    // If group_id is provided, check it's valid
+    if (params.group_id === 0) {
+      return {
+        valid: false,
+        error: 'Invalid group_id: 0 for send_file',
+        help: `CORRECT USAGE: {"action":"send_file","group_id":123456,"file_path":"files/report.pdf","end":true}`
+      };
+    }
+  }
+
+  // Check for missing message in text actions
+  if ((params.action === 'send_private_message' || params.action === 'send_group_message') && !params.message) {
+    const idField = params.action === 'send_private_message' ? 'user_id' : 'group_id';
+    const idValue = params.action === 'send_private_message' ? params.user_id : params.group_id;
+    return {
+      valid: false,
+      error: `Missing message for ${params.action}`,
+      help: `CORRECT USAGE: {"action":"${params.action}","${idField}":${idValue || 123456},"message":"Your message here","end":true}`
+    };
+  }
+
+  return { valid: true };
+}
+
 export async function executeQQTool(
   adapter: QQAdapter,
   _configManager: QQConfigManager,
@@ -122,10 +198,28 @@ export async function executeQQTool(
   }
 ): Promise<QQToolResult> {
   try {
+    // Validate parameters first
+    const validation = validateQQParams(params);
+    if (!validation.valid) {
+      return {
+        success: false,
+        message: `ERROR: ${validation.error}\n\n${validation.help}\n\nPlease correct your parameters and try again.`
+      };
+    }
+
+    // Special handling: if message is "NO", don't send anything (AI chooses not to reply)
+    if ((params.action === 'send_private_message' || params.action === 'send_group_message') &&
+        params.message?.trim() === 'NO') {
+      return { success: true, message: '[No reply sent - AI chose not to respond]' };
+    }
+
     // Handle receive_file action
     if (params.action === 'receive_file') {
       if (!params.file_id) {
-        return { success: false, message: 'Error: file_id is required for receive_file' };
+        return { 
+          success: false, 
+          message: 'Error: file_id is required for receive_file\n\nCORRECT USAGE: {"action":"receive_file","file_id":"abc123","end":true}' 
+        };
       }
       const fileInfo = await adapter.receiveFile(params.file_id);
       if (fileInfo) {
@@ -156,12 +250,19 @@ export async function executeQQTool(
     });
 
     if (result.includes('Error')) {
-      return { success: false, message: result };
+      // Include helpful guidance in error messages
+      return { 
+        success: false, 
+        message: `${result}\n\nIf you're having trouble, remember:\n- For groups: use group_id (positive number, not 0)\n- For private: use user_id\n- For @ mentions: include [CQ:at,qq=USER_ID] in message text\n\nExample: {"action":"send_group_message","group_id":123456,"message":"Hello [CQ:at,qq=789012], how are you?","end":true}`
+      };
     }
 
     return { success: true, message: result };
   } catch (error) {
     const msg = error instanceof Error ? error.message : String(error);
-    return { success: false, message: `Error: ${msg}` };
+    return { 
+      success: false, 
+      message: `Error: ${msg}\n\nQQ TOOL USAGE GUIDE:\n- send_group_message: requires group_id (positive number) and message\n- send_private_message: requires user_id and message\n- send_file: requires file_path and either user_id or group_id\n- Use [CQ:at,qq=USER_ID] in message text to @ mention someone`
+    };
   }
 }

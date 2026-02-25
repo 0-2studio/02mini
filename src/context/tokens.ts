@@ -152,16 +152,17 @@ export function getTokenStatus(
   const max = TOKEN_CONFIG.maxHistoryTokens;
   const remaining = max - total;
   const percentage = (total / max) * 100;
-  
+
   let status: 'ok' | 'light' | 'medium' | 'critical' = 'ok';
-  if (total >= TOKEN_CONFIG.criticalThreshold) {
+  // Updated thresholds: 50% light, 70% medium, 85% critical
+  if (percentage >= 85) {
     status = 'critical';
-  } else if (total >= TOKEN_CONFIG.mediumThreshold) {
+  } else if (percentage >= 70) {
     status = 'medium';
-  } else if (total >= TOKEN_CONFIG.lightThreshold) {
+  } else if (percentage >= 50) {
     status = 'light';
   }
-  
+
   return {
     used: total,
     max,
@@ -194,9 +195,9 @@ export function formatTokenCount(count: number): string {
 /**
  * Check if compaction is needed
  * New threshold strategy:
- * - >90%: light compression (simple pruning)
- * - >95%: medium compression (AI summarization)
- * - >98%: heavy compression (aggressive + AI)
+ * - >50%: light compression (simple pruning)
+ * - >70%: medium compression (AI summarization)
+ * - >85%: heavy compression (aggressive + AI)
  */
 export function checkCompactionNeeded(
   messages: ChatMessage[],
@@ -204,14 +205,20 @@ export function checkCompactionNeeded(
 ): { needed: boolean; level: 'none' | 'light' | 'medium' | 'heavy'; stats: ReturnType<typeof getTokenStatus> } {
   const stats = getTokenStatus(messages, model);
   const { total } = countConversationTokens(messages, model);
-  
-  if (total >= TOKEN_CONFIG.criticalThreshold) {
+  const maxTokens = TOKEN_CONFIG.maxHistoryTokens;
+
+  // Heavy compression at >85%
+  if (total >= maxTokens * 0.85) {
     return { needed: true, level: 'heavy', stats };
-  } else if (total >= TOKEN_CONFIG.mediumThreshold) {
+  }
+  // Medium compression at >70%
+  else if (total >= maxTokens * 0.7) {
     return { needed: true, level: 'medium', stats };
-  } else if (total >= TOKEN_CONFIG.lightThreshold) {
+  }
+  // Light compression at >50%
+  else if (total >= maxTokens * 0.5) {
     return { needed: true, level: 'light', stats };
   }
-  
+
   return { needed: false, level: 'none', stats };
 }

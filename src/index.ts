@@ -160,7 +160,7 @@ async function main() {
 
   // Cleanup function with proper async handling
   let isShuttingDown = false;
-  const cleanup = async (signal: string) => {
+  const cleanup = async (signal: string, exitCode: number = 0): Promise<void> => {
     if (isShuttingDown) {
       console.log('[02] Already shutting down...');
       return;
@@ -198,19 +198,27 @@ async function main() {
       console.log('[02] Cleanup complete. Goodbye!');
     } catch (error) {
       console.error('[02] Error during cleanup:', error);
-    } finally {
-      process.exit(0);
+      exitCode = 1;
     }
+    process.exit(exitCode);
   };
 
-  // Handle multiple termination signals
-  process.on('SIGINT', () => cleanup('SIGINT'));
-  process.on('SIGTERM', () => cleanup('SIGTERM'));
+  // Handle graceful shutdown signals
+  process.once('SIGINT', () => {
+    console.log('[02] SIGINT received, starting graceful shutdown...');
+    cleanup('SIGINT', 0);
+  });
+  
+  process.once('SIGTERM', () => {
+    console.log('[02] SIGTERM received, starting graceful shutdown...');
+    cleanup('SIGTERM', 0);
+  });
 
-  // Handle uncaught errors
+  // Handle uncaught errors - immediate exit for safety
   process.on('uncaughtException', (error) => {
     console.error('[02] Uncaught exception:', error);
-    cleanup('uncaughtException');
+    console.error('[02] Forcing immediate exit due to uncaught exception');
+    process.exit(1);
   });
 
   process.on('unhandledRejection', (reason, promise) => {

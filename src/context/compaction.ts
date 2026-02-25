@@ -249,10 +249,10 @@ export async function compactContext(
 /**
  * Incremental compaction - try levels progressively
  * New thresholds:
- * - <=90%: No compaction
- * - 90-95%: Light compression (pruning)
- * - 95-98%: Medium compression (AI summarization)
- * - >=98%: Heavy compression (AI aggressive summarization)
+ * - <=50%: No compaction
+ * - 50-70%: Light compression (pruning)
+ * - 70-85%: Medium compression (AI summarization)
+ * - 85-100%: Heavy compression (AI aggressive summarization)
  * - >=100%: Emergency pruning
  */
 export async function incrementalCompaction(
@@ -262,9 +262,9 @@ export async function incrementalCompaction(
 ): Promise<CompactionResult> {
   const { total } = countConversationTokens(messages);
   const percentage = total / maxTokens;
-  
-  if (percentage <= 0.9) {
-    // No compaction needed (<90%)
+
+  if (percentage <= 0.5) {
+    // No compaction needed (<50%)
     return {
       level: 'none',
       originalMessages: messages.length,
@@ -276,22 +276,22 @@ export async function incrementalCompaction(
       success: true,
     };
   }
-  
-  // Light compression at 90-95%
-  if (percentage <= 0.95) {
+
+  // Light compression at 50-70%
+  if (percentage <= 0.7) {
     return pruneMessages(messages, TOKEN_CONFIG.targetTokensAfterCompression, COMPACTION_STRATEGIES.light.rules);
   }
-  
-  // Medium compression at 95-98% (use AI)
-  if (percentage <= 0.98) {
+
+  // Medium compression at 70-85% (use AI)
+  if (percentage <= 0.85) {
     return mediumCompaction(messages, TOKEN_CONFIG.targetTokensAfterCompression, aiClient);
   }
-  
-  // Heavy compression at 98-100% (use AI)
+
+  // Heavy compression at 85-100% (use AI)
   if (percentage < 1.0) {
     return heavyCompaction(messages, TOKEN_CONFIG.targetTokensAfterCompression * 0.8, aiClient);
   }
-  
+
   // Emergency pruning at >=100%
   return emergencyPrune(messages, maxTokens);
 }

@@ -1,79 +1,164 @@
 # 02mini - 自驱动 AI 系统
 
-一个具有自我认知、技能系统和定时任务能力的 AI 助手。
+[![TypeScript](https://img.shields.io/badge/TypeScript-5.0+-blue.svg)](https://www.typescriptlang.org/)
+[![Bun](https://img.shields.io/badge/Bun-1.0+-orange.svg)](https://bun.sh/)
+[![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 
-## 架构
+一个具有自我认知、技能系统和定时任务能力的 AI 助手框架。支持 CLI 交互、QQ 机器人、HTTP API 和 WebSocket 网关。
+
+## 特性
+
+- **自我认知** - AI 拥有身份定义和记忆系统
+- **技能系统** - 可扩展的技能模块，支持动态加载
+- **定时任务** - 支持 Cron、一次性任务和间隔任务
+- **上下文压缩** - 智能压缩对话历史，支持长对话
+- **MCP 协议** - 支持 Model Context Protocol 工具扩展
+- **QQ 机器人** - 通过 NapCat 接入 QQ 群聊和私聊
+- **HTTP API** - OpenAI 兼容的 API 接口
+- **WebSocket** - 实时双向通信
+
+## 快速开始
+
+### 环境要求
+
+- [Bun](https://bun.sh/) 1.0+ (推荐) 或 Node.js 18+
+- 支持 OpenAI API 格式的 AI 服务 (OpenAI、DeepSeek、智谱等)
+
+### 安装
+
+```bash
+# 克隆仓库
+git clone https://github.com/your-username/02mini.git
+cd 02mini
+
+# 安装依赖
+bun install
+
+# 复制环境变量配置
+cp .env.example .env
+
+# 编辑 .env 文件，填入你的 API 配置
+```
+
+### 配置
+
+编辑 `.env` 文件：
+
+```env
+# AI 服务配置
+AI_BASE_URL=https://api.openai.com/v1
+AI_API_KEY=your-api-key-here
+AI_MODEL=gpt-4o-mini
+AI_TEMPERATURE=0.7
+AI_MAX_TOKENS=4096
+
+# 网关配置 (可选)
+GATEWAY_PORT=3000
+GATEWAY_TOKEN=your-secret-token
+
+# 自主运行配置 (可选)
+AUTONOMOUS_ENABLED=true
+HEARTBEAT_INTERVAL=5
+```
+
+### 运行
+
+```bash
+# 开发模式
+bun start
+
+# 编译
+bun run build
+
+# 运行编译版本
+node dist/index.js
+```
+
+## 项目结构
 
 ```
 02mini/
-├── important/      # 核心定义（只读）
-│   ├── soul.md          # AI 身份定义
-│   ├── architecture.md  # 系统架构
-│   ├── heartbeat.md     # 定时任务
-│   └── skills-guide.md  # 技能指南
-├── memory/         # 可写内存
-│   ├── self-reflections/  # 自我反思
-│   ├── daily-logs/        # 每日日志
-│   ├── knowledge/         # 知识库
-│   └── user-profile.md    # 用户档案
-├── skills/         # 技能文件夹
-│   ├── cli-bridge/    # CLI 通讯（必须）
-│   ├── file-manager/  # 文件管理
-│   ├── memory-reader/ # 内存读取
-│   ├── self-modify/   # 自我修改
-│   └── skill-creator/ # 创建技能
-└── src/            # 源代码
-```
-
-## 安装
-
-需要 [Bun](https://bun.sh) 运行时。
-
-```bash
-bun install
-```
-
-## 运行
-
-```bash
-# 直接运行（无需编译）
-bun start
-
-# 开发模式（热重载）
-bun dev
-
-# 打包
-bun run build
-```
-
-## MCP 配置
-
-编辑 `mcp-config.json` 配置 MCP 服务器：
-
-```json
-{
-  "mcpServers": {
-    "filesystem": {
-      "command": "npx",
-      "args": ["-y", "@modelcontextprotocol/server-filesystem", "."]
-    }
-  }
-}
+├── src/                      # 源代码
+│   ├── index.ts             # 主入口
+│   ├── core/
+│   │   └── engine.ts        # 核心引擎 (AI处理、工具调用)
+│   ├── ai/
+│   │   └── client.ts        # OpenAI 兼容 API 客户端
+│   ├── cli/
+│   │   └── interface.ts     # CLI 交互界面
+│   ├── gateway/             # HTTP API + WebSocket 网关
+│   │   ├── server.ts
+│   │   └── routes/
+│   ├── mcp/                 # MCP 协议集成
+│   │   ├── client.ts
+│   │   └── manager.ts
+│   ├── cron/                # 定时任务调度
+│   │   ├── scheduler.ts
+│   │   ├── store.ts
+│   │   └── tool.ts
+│   ├── qq/                  # QQ 机器人适配器
+│   │   ├── adapter.ts
+│   │   ├── tools.ts
+│   │   └── config.ts
+│   ├── context/             # 上下文管理
+│   │   ├── manager.ts
+│   │   ├── compaction.ts
+│   │   └── tokens.ts
+│   └── skills-impl/         # 技能实现
+│
+├── important/               # 核心定义 (只读)
+│   ├── soul.md             # AI 身份定义
+│   ├── architecture.md     # 系统架构
+│   ├── heartbeat.md        # 定时任务配置
+│   ├── skills-guide.md     # 技能指南
+│   └── qq-config.json      # QQ 机器人配置
+│
+├── memory/                  # 可写内存系统
+│   ├── user-profile.md     # 用户档案
+│   ├── skills-inventory.md # 技能清单
+│   ├── self-reflections/   # 自我反思记录
+│   ├── daily-logs/         # 每日日志
+│   ├── daily-summaries/    # 每日总结
+│   └── knowledge/          # 知识库
+│
+├── skills/                  # 技能定义
+│   ├── cli-bridge/         # 用户通信 (必需)
+│   ├── file-manager/       # 文件管理
+│   ├── memory-reader/      # 内存读取
+│   ├── memory-organizer/   # 内存组织
+│   ├── self-modify/        # 自我修改
+│   ├── skill-creator/      # 技能创建
+│   └── ocr-processor/      # OCR 处理
+│
+├── files/                   # 生成文件存储
+│   └── qq-uploads/         # QQ 文件上传
+│
+├── docs/                    # 文档
+│
+├── .env.example            # 环境变量示例
+├── mcp-config.json         # MCP 服务器配置
+├── tsconfig.json           # TypeScript 配置
+└── package.json            # 项目配置
 ```
 
 ## CLI 命令
 
-- `/skills` - 列出所有技能
-- `/mcp` - 列出 MCP 工具
-- `/read <file>` - 读取文件
-- `/context` - 显示上下文窗口状态
-- `/compact` - 手动压缩对话历史
-- `/qq` - QQ 机器人管理 (NapCat)
-- `/exit` - 退出
+| 命令 | 说明 |
+|------|------|
+| `/help` | 显示帮助信息 |
+| `/skills` | 列出所有技能 |
+| `/mcp` | 列出 MCP 工具 |
+| `/read <file>` | 读取文件 |
+| `/write <file>` | 写入文件 |
+| `/context` | 显示上下文窗口状态 |
+| `/compact` | 手动压缩对话历史 |
+| `/qq` | QQ 机器人管理 |
+| `/cron` | 定时任务管理 |
+| `/exit` | 退出程序 |
 
 ## 技能系统
 
-每个技能是一个文件夹，包含 `SKILL.md`：
+每个技能是一个文件夹，包含 `SKILL.md` 文件：
 
 ```yaml
 ---
@@ -84,225 +169,220 @@ triggers:
   - 触发条件2
 ---
 
-# 技能详细说明...
+# 技能详细说明
+
+## 使用方法
+...
+
+## 示例
+...
 ```
+
+### 内置技能
+
+| 技能 | 说明 |
+|------|------|
+| `cli-bridge` | CLI 用户通信 (必需) |
+| `file-manager` | 文件读写操作 |
+| `memory-reader` | 读取内存文件 |
+| `memory-organizer` | 组织和整理记忆 |
+| `self-modify` | 自我修改代码 |
+| `skill-creator` | 创建新技能 |
+| `ocr-processor` | OCR 文字识别 |
 
 ## 定时任务
 
-在 `important/heartbeat.md` 中定义：
+在 `important/heartbeat.md` 中定义定时任务：
 
-- 每 5 分钟任务
-- 每小时任务
-- 每日任务（09:00）
-- 每周任务（周日 10:00）
+```markdown
+## 每 5 分钟
+- 检查待办事项
+- 检查提醒
+
+## 每日 09:00
+- 每日记忆整理
+- 生成每日总结
+
+## 每周周日 10:00
+- 周报生成
+- 记忆归档
+```
+
+### 使用 CLI 管理
+
+```bash
+# 列出所有任务
+/cron list
+
+# 添加任务
+/cron add "提醒我开会" at 15:30
+
+# 添加间隔任务
+/cron add "检查邮件" every 30m
+
+# 删除任务
+/cron delete <job_id>
+```
 
 ## 上下文压缩
 
-02mini 实现了智能文本压缩功能，参考 OpenClaw 的设计：
-
-### 自动压缩
-
-当对话历史达到一定阈值时，系统自动触发压缩：
+智能压缩对话历史，支持长对话：
 
 | 级别 | 触发条件 | 策略 |
 |------|----------|------|
-| 🟢 OK | < 60% | 不压缩 |
-| 🟡 Light | 60-85% | 移除低重要性消息 |
-| 🟠 Medium | 85-95% | 压缩旧消息，保留关键事实 |
-| 🔴 Heavy | > 95% | 激进压缩，仅保留系统和最近消息 |
-| ⚠️ Emergency | 超限 | 紧急裁剪，只保留最少必要消息 |
+| OK | < 50% | 不压缩 |
+| Light | 50-70% | 程序修剪冗余消息 |
+| Medium | 70-85% | AI 生成摘要 |
+| Heavy | 85-100% | AI 激进压缩 |
+| Emergency | ≥ 100% | 紧急裁剪 |
 
 ### 保护规则
 
-以下消息类型不会被压缩：
-- System 消息（身份定义）
-- 最近 4 条消息
-- 未完成的工具调用链
-- 包含重要关键词的消息（如 "记住", "不要忘"）
+- System 消息不会被压缩
+- 最近 3 条消息保留
+- 未完成的工具调用链保留
 
-### 手动压缩
+## QQ 机器人
 
-使用 `/compact` 命令手动触发压缩。
+通过 NapCat 接入 QQ：
 
-### 状态查看
+### 配置 NapCat
 
-使用 `/context` 命令查看当前上下文状态：
-- 消息数量统计
-- Token 使用比例
-- 压缩历史记录
-
-## 网关 API (Gateway)
-
-02mini 提供 HTTP API 和 WebSocket 接口，允许外部应用连接。
-
-### 启动网关
-
-网关默认在 `http://localhost:3000` 启动：
-
-```bash
-# 设置端口（默认 3000）
-export GATEWAY_PORT=3000
-
-# 设置认证 Token（可选）
-export GATEWAY_TOKEN=your-secret-token
-
-# 运行
-bun start
-```
-
-### API 端点
-
-#### 健康检查
-```bash
-GET /health
-```
-
-#### 发送消息
-```bash
-POST /api/send
-Content-Type: application/json
-
+```json
 {
-  "message": "你好，02",
-  "sessionId": "optional-session-id"
+  "network": {
+    "websocketClients": [{
+      "name": "02mini",
+      "enable": true,
+      "url": "ws://localhost:3002/onebot"
+    }]
+  }
 }
 ```
 
-#### OpenAI 兼容接口
-```bash
-POST /v1/chat/completions
-Content-Type: application/json
-Authorization: Bearer your-token
+### 配置 02mini
 
+编辑 `important/qq-config.json`：
+
+```json
 {
-  "model": "02mini",
-  "messages": [
-    {"role": "user", "content": "你好"}
-  ]
+  "config": {
+    "enabled": true,
+    "mode": "websocket-client",
+    "napcatWsUrl": "ws://localhost:8082"
+  },
+  "permissions": {
+    "allowAllPrivate": true,
+    "allowedGroups": [123456789]
+  }
 }
 ```
 
-#### 获取系统状态
+### QQ 功能
+
+- 私聊支持
+- 群聊支持 (@ 触发或全部消息)
+- 权限管理 (白名单/黑名单)
+- 文件收发
+- @ 提及
+
+## HTTP API
+
+### 端点
+
+| 端点 | 方法 | 说明 |
+|------|------|------|
+| `/health` | GET | 健康检查 |
+| `/api/send` | POST | 发送消息 |
+| `/api/status` | GET | 系统状态 |
+| `/api/cron/jobs` | GET | 定时任务列表 |
+| `/v1/chat/completions` | POST | OpenAI 兼容接口 |
+
+### OpenAI 兼容接口
+
 ```bash
-GET /api/status
+curl http://localhost:3000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer your-token" \
+  -d '{
+    "model": "02mini",
+    "messages": [{"role": "user", "content": "你好"}]
+  }'
 ```
 
-#### 获取定时任务列表
-```bash
-GET /api/cron/jobs
-```
+## WebSocket
 
-#### WebSocket 连接
 ```javascript
 const ws = new WebSocket('ws://localhost:3000/ws');
 
 ws.onopen = () => {
   ws.send(JSON.stringify({
     type: 'message',
-    content: '你好',
-    sessionId: 'my-session'
+    content: '你好'
   }));
 };
 
 ws.onmessage = (event) => {
   const data = JSON.parse(event.data);
-  console.log(data.content); // AI 回复
+  console.log(data.content);
 };
 ```
 
-### WebSocket 消息类型
+## MCP 工具
 
-- `ping` / `pong` - 心跳
-- `message` - 发送用户消息
-- `response` - AI 回复
-- `proactive` - AI 主动发送的消息
-- `error` - 错误信息
+配置 `mcp-config.json` 添加外部工具：
 
-## 自主运行 (Autonomous)
-
-02mini 支持自主运行模式，AI 可以主动给用户发送消息。
-
-### 工作原理
-
-1. **心跳检查** - 每 N 分钟检查一次是否有需要主动沟通的内容
-2. **Cron 触发** - 定时任务可以触发 AI 主动执行
-3. **系统事件** - 特定事件可以触发主动消息
-
-### 配置
-
-```bash
-# 启用/禁用自主运行（默认启用）
-export AUTONOMOUS_ENABLED=true
-
-# 心跳间隔（分钟，默认 5）
-export HEARTBEAT_INTERVAL=5
-
-# 每小时最大主动消息数（默认 10）
-export MAX_PROACTIVE_PER_HOUR=10
+```json
+{
+  "mcpServers": {
+    "filesystem": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-filesystem", "."]
+    },
+    "fetch": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-fetch"]
+    }
+  }
+}
 ```
 
-### 活跃时段
+## 开发
 
-默认只在 09:00-22:00 之间主动发送消息，避免打扰休息。
+### 构建
 
-### 触发条件
+```bash
+bun run build
+```
 
-AI 会在以下情况主动发消息：
-- 有到期的提醒任务
-- 有需要跟进的事项
-- 有重要信息需要分享
-- 用户可能需要帮助（基于上下文判断）
+### 项目脚本
 
-### 消息格式
+```json
+{
+  "scripts": {
+    "start": "bun src/index.ts",
+    "build": "bun build src/index.ts --outdir=dist --target=node",
+    "dev": "bun --watch src/index.ts"
+  }
+}
+```
 
-主动消息会在 CLI 中以 `[Proactive]` 标记显示，并播放提示音。
+## 贡献
 
-### 静默期
+欢迎贡献代码！请遵循以下步骤：
 
-用户发送消息后，会有 1 分钟的静默期，期间不会发送主动消息。
+1. Fork 本仓库
+2. 创建功能分支 (`git checkout -b feature/amazing-feature`)
+3. 提交更改 (`git commit -m 'Add amazing feature'`)
+4. 推送到分支 (`git push origin feature/amazing-feature`)
+5. 创建 Pull Request
 
-## QQ 机器人集成 (NapCat)
+## 许可证
 
-02mini 可以通过 NapCat 接入 QQ，成为 QQ 机器人。
+[MIT License](LICENSE)
 
-### 快速开始
+## 致谢
 
-1. **安装 NapCat**
-   - 下载：https://github.com/NapNeko/NapCatQQ/releases
-   - 登录 QQ 小号
-
-2. **配置 NapCat**
-   ```json
-   {
-     "network": {
-       "websocketClients": [{
-         "name": "02mini",
-         "enable": true,
-         "url": "ws://localhost:3002/onebot"
-       }]
-     }
-   }
-   ```
-
-3. **启用 QQ 模块**
-   ```
-   /qq enable
-   ```
-
-4. **设置权限**
-   ```
-   /qq allow group 123456789  # 允许特定群
-   /qq allow user 987654321   # 允许特定用户
-   ```
-
-### 特性
-
-- ✅ 私聊支持
-- ✅ 群聊支持 (@ 触发)
-- ✅ 权限管理 (白名单/黑名单)
-- ✅ AI 主动发消息
-- ✅ 长消息自动分段
-
-### 详细文档
-
-查看 [docs/QQ_SETUP.md](docs/QQ_SETUP.md) 获取完整教程。
+- [OpenClaw](https://github.com/openclaw/openclaw) - 架构参考
+- [NapCat](https://github.com/NapNeko/NapCatQQ) - QQ 机器人协议
+- [Model Context Protocol](https://modelcontextprotocol.io/) - 工具协议

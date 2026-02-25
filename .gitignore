@@ -1,16 +1,42 @@
-# Dependencies
+# ================================
+# 02mini - Git Ignore Configuration
+# ================================
+
+# ----- Dependencies -----
 node_modules/
 package-lock.json
 yarn.lock
 pnpm-lock.yaml
+bun.lock
 bun.lockb
 
-# Build output
+# ----- Build Output -----
 build/
 dist/
 *.tsbuildinfo
 
-# Logs
+# ----- Environment Variables (Sensitive) -----
+.env
+.env.local
+.env.*.local
+# Keep example file
+!.env.example
+
+# ----- IDE & Editor -----
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+*.sublime-*
+
+# ----- OS Files -----
+.DS_Store
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+
+# ----- Logs -----
 logs/
 *.log
 npm-debug.log*
@@ -18,31 +44,69 @@ yarn-debug.log*
 yarn-error.log*
 pnpm-debug.log*
 
-# Environment variables
-.env
-.env.local
-.env.*.local
+# ----- Runtime Data -----
+# Cron job storage
+memory/cron-store.json
 
-# IDE
-.vscode/
-.idea/
-*.swp
-*.swo
-*~
+# Session data
+sessions/
 
-# OS files
-.DS_Store
-Thumbs.db
+# Temporary files
+tmp/
+temp/
 
-# Memory files (personal data)
-memory/self-reflections/*.md
-memory/daily-logs/*.md
-memory/knowledge/*.md
-!memory/self-reflections/.gitkeep
+# ----- Memory System (User Data) -----
+# Daily logs (auto-generated)
+memory/daily-logs/*
 !memory/daily-logs/.gitkeep
+
+# Daily summaries (auto-generated)
+memory/daily-summaries/*
+!memory/daily-summaries/.gitkeep
+
+# Self reflections (personal)
+memory/self-reflections/*
+!memory/self-reflections/.gitkeep
+
+# Knowledge base (personal)
+memory/knowledge/*
 !memory/knowledge/.gitkeep
 
-# User files (generated content)
+# Group members cache
+memory/group-members/*
+!memory/group-members/.gitkeep
+
+# Planned changes (temporary)
+memory/planned-changes/*
+!memory/planned-changes/.gitkeep
+
+# Keep essential memory files
+!memory/user-profile.md
+!memory/skills-inventory.md
+!memory/README.md
+
+# ----- Generated Files -----
 files/*
 !files/README.md
 !files/.gitkeep
+!files/qq-uploads/.gitkeep
+
+# QQ uploads (user files)
+files/qq-uploads/*
+!files/qq-uploads/.gitkeep
+
+# ----- Backup Files -----
+backup/
+*.backup
+*.bak
+
+# ----- MCP Cache -----
+.mcp-cache/
+
+# ----- Test & Coverage -----
+coverage/
+.nyc_output/
+
+# ----- Cache -----
+.cache/
+.parcel-cache/

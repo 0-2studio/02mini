@@ -89,6 +89,9 @@ export interface QQConfig {
   maxMessageLength: number;
   splitLongMessages: boolean;
   typingIndicator: boolean;
+  // Session processing options
+  parallelProcessing: boolean;  // Process multiple sessions in parallel
+  accumulationDelay: number;    // Delay in ms to wait for message accumulation
 }
 
 /** QQ Permission settings */
@@ -162,6 +165,9 @@ export const DEFAULT_QQ_CONFIG: QQConfig = {
   maxMessageLength: 2000,
   splitLongMessages: true,
   typingIndicator: false,
+  // Session processing defaults
+  parallelProcessing: true,   // Process sessions in parallel by default
+  accumulationDelay: 200,     // 200ms delay for message accumulation
 };
 
 /** Simple message queue item */
