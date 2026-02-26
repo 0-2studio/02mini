@@ -360,3 +360,100 @@ export async function aiHeavyCompaction(
     summaryBlocks,
   };
 }
+
+/**
+ * AI-powered light compression
+ * Gentle summarization - keeps more context, only summarizes very old messages
+ */
+export async function aiLightCompaction(
+  messages: ChatMessage[],
+  targetTokens: number,
+  aiClient?: { chatCompletion: (messages: ChatMessage[], tools?: any[]) => Promise<any> }
+): Promise<{
+  summaryMessage: ChatMessage;
+  keptMessages: ChatMessage[];
+  summaryBlocks: SummaryBlock[];
+}> {
+  // Keep more recent messages for light compression (6 instead of 3)
+  const { toSummarize, toKeep, summarizeIndices } = selectMessagesForSummarization(messages, 6);
+
+  let summaryContent = '';
+  let summaryBlocks: SummaryBlock[] = [];
+
+  if (toSummarize.length > 0) {
+    // Create gentle summary for older messages
+    const result = await summarizeWithAI(toSummarize, aiClient);
+    summaryContent = `[Earlier context] ${result.summary}`;
+
+    summaryBlocks = [{
+      originalRange: [0, summarizeIndices.length - 1],
+      summary: summaryContent,
+      tokenCount: result.tokenCount,
+      keyFacts: result.keyFacts,
+    }];
+  }
+
+  const summaryMessage: ChatMessage = {
+    role: 'assistant',
+    content: summaryContent || '[Earlier conversation context preserved]',
+  };
+
+  // Re-inject post-compaction reminder and reorganize messages
+  const systemMessages = toKeep.filter(m => m.role === 'system');
+  const nonSystemKept = toKeep.filter(m => m.role !== 'system');
+
+  return {
+    summaryMessage,
+    keptMessages: [POST_COMPACTION_REMINDER, ...systemMessages, summaryMessage, ...nonSystemKept],
+    summaryBlocks,
+  };
+}
+
+/**
+ * AI-powered emergency compression
+ * Minimalist summarization when context is at critical level
+ * Preserves essential information only
+ */
+export async function aiEmergencyCompaction(
+  messages: ChatMessage[],
+  targetTokens: number,
+  aiClient?: { chatCompletion: (messages: ChatMessage[], tools?: any[]) => Promise<any> }
+): Promise<{
+  summaryMessage: ChatMessage;
+  keptMessages: ChatMessage[];
+  summaryBlocks: SummaryBlock[];
+}> {
+  // Keep only most recent 2 messages for emergency
+  const { toSummarize, toKeep, summarizeIndices } = selectMessagesForSummarization(messages, 2);
+
+  let summaryContent = '';
+  let summaryBlocks: SummaryBlock[] = [];
+
+  if (toSummarize.length > 0) {
+    // Create ultra-compact summary
+    const result = await summarizeWithAI(toSummarize, aiClient);
+    summaryContent = `[${toSummarize.length} msgs] ${result.summary.slice(0, 500)}`;
+
+    summaryBlocks = [{
+      originalRange: [0, summarizeIndices.length - 1],
+      summary: summaryContent,
+      tokenCount: Math.min(result.tokenCount, 150), // Limit tokens
+      keyFacts: result.keyFacts.slice(0, 5), // Limit key facts
+    }];
+  }
+
+  const summaryMessage: ChatMessage = {
+    role: 'assistant',
+    content: summaryContent || '[Context: critical compression applied]',
+  };
+
+  // Re-inject post-compaction reminder and reorganize messages
+  const systemMessages = toKeep.filter(m => m.role === 'system');
+  const nonSystemKept = toKeep.filter(m => m.role !== 'system');
+
+  return {
+    summaryMessage,
+    keptMessages: [POST_COMPACTION_REMINDER, ...systemMessages, summaryMessage, ...nonSystemKept],
+    summaryBlocks,
+  };
+}

@@ -10,7 +10,9 @@ import path from 'path';
 import type { CoreEngine } from '../core/engine.js';
 import { stripMessageMarker } from '../core/engine.js';
 import { Semaphore } from '../ai/semaphore.js';
+import { globalApiLock } from '../ai/api-lock.js';
 import type { QQConfigManager } from './config.js';
+import type { ChatMessage } from '../ai/client.js';
 import type {
   OneBotMessageEvent,
   OneBotMetaEvent,
@@ -91,6 +93,13 @@ export class QQAdapter extends EventEmitter {
   private readonly maxReconnectDelay: number = 60000; // Max 60 seconds
   private reconnectTimer?: NodeJS.Timeout;
   private isReconnecting: boolean = false;
+
+  // QQ Context Compression
+  private isCompressing: boolean = false;
+  private pendingQQMessagesDuringCompression: string[] = [];
+  private qqSummaryMessage?: string; // Current QQ summary
+  private readonly COMPRESSION_THRESHOLD = 0.5; // 50% token usage
+  private compressionLockKey = 'qq-compression';
 
   constructor(options: QQAdapterOptions) {
     super();
@@ -1001,13 +1010,17 @@ export class QQAdapter extends EventEmitter {
   }
 
   private async processSession(session: SessionMessages): Promise<void> {
-    // Build context
+    // Step 1: Check and compress QQ context if needed
+    // This extracts QQ messages, generates summary, and updates context
+    await this.checkAndCompressQQContext();
+
+    // Step 2: Build context
     const context = await this.buildSessionContext(session);
 
-    // Build prompt with messages
+    // Step 3: Build prompt with messages
     const conversationHistory = this.buildPrompt(session, context);
 
-    // Use the main engine with shared context
+    // Step 4: Use the main engine with shared context
     // All sessions share the same messages array for cross-session memory
     console.log('[QQ] Sending to AI with SHARED context...');
     const response = await this.engine.processUserInput(conversationHistory);
@@ -1411,5 +1424,220 @@ Now process these messages and respond appropriately.`;
   scheduleFileCleanup(_hours: number): void {
     // Stub method for compatibility - file cleanup not implemented in simplified version
     console.log('[QQ] File cleanup scheduled (stub)');
+  }
+
+  // ==================== QQ Context Compression ====================
+
+  /**
+   * Check if QQ context compression is needed and trigger it
+   * Called before processing new QQ messages
+   */
+  private async checkAndCompressQQContext(): Promise<void> {
+    if (this.isCompressing) {
+      return; // Already compressing, skip
+    }
+
+    const messages = this.engine.getMessages();
+    const tokenUsage = await this.calculateTokenUsage(messages);
+
+    if (tokenUsage >= this.COMPRESSION_THRESHOLD) {
+      console.log(`[QQ] Context compression triggered (${Math.round(tokenUsage * 100)}% tokens)`);
+      await this.compressQQContext();
+    }
+  }
+
+  /**
+   * Calculate token usage ratio
+   */
+  private async calculateTokenUsage(messages: ChatMessage[]): Promise<number> {
+    // Simple estimation: ~4 characters per token
+    const totalChars = messages.reduce((sum, msg) => sum + (msg.content?.length || 0), 0);
+    const estimatedTokens = totalChars / 4;
+    const maxTokens = 8000; // Match TOKEN_CONFIG.maxHistoryTokens
+    return estimatedTokens / maxTokens;
+  }
+
+  /**
+   * Compress QQ context by:
+   * 1. Extracting QQ messages (including existing summary)
+   * 2. Deleting them from context
+   * 3. Generating new summary with AI
+   * 4. Inserting new summary
+   * 5. Adding buffered messages
+   */
+  private async compressQQContext(): Promise<void> {
+    this.isCompressing = true;
+
+    try {
+      // Step 1: Extract QQ-related messages and delete them
+      const { extractedMessages, remainingMessages } = this.extractAndDeleteQQMessages();
+
+      if (extractedMessages.length === 0) {
+        console.log('[QQ] No QQ messages to compress');
+        return;
+      }
+
+      console.log(`[QQ] Extracted ${extractedMessages.length} messages for compression`);
+
+      // Step 2: Generate summary with AI
+      const newSummary = await this.generateQQSummary(extractedMessages);
+
+      // Step 3: Insert new summary into remaining messages
+      const messagesWithSummary = this.insertSummaryIntoMessages(remainingMessages, newSummary);
+
+      // Step 4: Update engine context
+      this.engine.setMessages(messagesWithSummary);
+      this.qqSummaryMessage = newSummary;
+
+      console.log(`[QQ] Context compressed successfully`);
+
+      // Step 5: Add buffered messages that arrived during compression
+      if (this.pendingQQMessagesDuringCompression.length > 0) {
+        console.log(`[QQ] Adding ${this.pendingQQMessagesDuringCompression.length} buffered messages`);
+        for (const msg of this.pendingQQMessagesDuringCompression) {
+          this.engine.getMessages().push({ role: 'user', content: msg });
+        }
+        this.pendingQQMessagesDuringCompression = [];
+      }
+    } catch (error) {
+      console.error('[QQ] Context compression failed:', error);
+    } finally {
+      this.isCompressing = false;
+    }
+  }
+
+  /**
+   * Extract QQ messages from context and return remaining messages
+   * Returns both extracted messages and remaining messages
+   */
+  private extractAndDeleteQQMessages(): { 
+    extractedMessages: ChatMessage[]; 
+    remainingMessages: ChatMessage[] 
+  } {
+    const messages = this.engine.getMessages();
+    const extracted: ChatMessage[] = [];
+    const remaining: ChatMessage[] = [];
+
+    for (const msg of messages) {
+      // Check if it's a QQ message
+      if (this.isQQMessage(msg)) {
+        extracted.push(msg);
+      } else {
+        remaining.push(msg);
+      }
+    }
+
+    return { extractedMessages: extracted, remainingMessages: remaining };
+  }
+
+  /**
+   * Check if a message is QQ-related
+   */
+  private isQQMessage(msg: ChatMessage): boolean {
+    const content = msg.content || '';
+    // QQ messages start with '[QQ' or contain QQ-related markers
+    return content.startsWith('[QQ') || 
+           content.startsWith('[QQ Messages') ||
+           content.includes('[QQ SUMMARY]');
+  }
+
+  /**
+   * Generate QQ context summary using AI
+   */
+  private async generateQQSummary(messages: ChatMessage[]): Promise<string> {
+    const aiClient = this.engine.getAIClient();
+    
+    // Build the conversation text for AI
+    const conversationText = messages.map((msg, idx) => {
+      const content = msg.content || '';
+      // Truncate very long messages
+      if (content.length > 1000) {
+        return `[${idx}] ${content.slice(0, 1000)}... (truncated)`;
+      }
+      return `[${idx}] ${content}`;
+    }).join('\n\n');
+
+    const summaryPrompt: ChatMessage[] = [
+      {
+        role: 'system',
+        content: 'You are summarizing QQ conversation context for compression. Create a concise but comprehensive summary.',
+      },
+      {
+        role: 'user',
+        content: `Please summarize the following QQ conversation history:
+
+${conversationText}
+
+Provide your summary in this format:
+[QQ SUMMARY]
+- Participants: [list users/groups involved]
+- Recent Topics: [what was discussed]
+- Key Information: [important facts, user preferences, pending tasks]
+- Context: [ongoing conversations or relationships]
+
+Be concise but ensure important details are preserved.`,
+      },
+    ];
+
+    try {
+      // Use globalApiLock to avoid conflicts with other AI calls
+      const response = await globalApiLock.withLock(() =>
+        aiClient.chatCompletion(summaryPrompt)
+      );
+
+      if (response?.choices?.[0]?.message?.content) {
+        const summary = response.choices[0].message.content;
+        console.log(`[QQ] Generated summary (${summary.length} chars)`);
+        return summary;
+      }
+    } catch (error) {
+      console.error('[QQ] Failed to generate summary:', error);
+    }
+
+    // Fallback: create simple summary
+    const userCount = new Set(messages.filter(m => m.role === 'user').map(m => m.content?.split(':')[0])).size;
+    return `[QQ SUMMARY] Conversation with ${userCount} users, ${messages.length} messages total. [Details omitted due to compression error]`;
+  }
+
+  /**
+   * Insert summary into messages (as system message at appropriate position)
+   */
+  private insertSummaryIntoMessages(messages: ChatMessage[], summary: string): ChatMessage[] {
+    // Find position after system prompts but before user messages
+    let insertIndex = 0;
+    for (let i = 0; i < messages.length; i++) {
+      if (messages[i].role === 'system') {
+        insertIndex = i + 1;
+      } else {
+        break;
+      }
+    }
+
+    // Insert summary as system message
+    const summaryMessage: ChatMessage = {
+      role: 'system',
+      content: summary,
+    };
+
+    const result = [...messages];
+    result.splice(insertIndex, 0, summaryMessage);
+    return result;
+  }
+
+  /**
+   * Add a QQ message to context, handling compression state
+   */
+  private async addQQMessageToContext(message: string): Promise<void> {
+    // Check if we need compression first
+    await this.checkAndCompressQQContext();
+
+    if (this.isCompressing) {
+      // Buffer the message during compression
+      this.pendingQQMessagesDuringCompression.push(message);
+      console.log('[QQ] Message buffered during compression');
+    } else {
+      // Add directly to context
+      this.engine.getMessages().push({ role: 'user', content: message });
+    }
   }
 }

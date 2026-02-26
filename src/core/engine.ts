@@ -92,6 +92,27 @@ export class CoreEngine {
   }
 
   /**
+   * Get the AI client for external use (e.g., QQ context compression)
+   */
+  getAIClient(): AIClient {
+    return this.aiClient;
+  }
+
+  /**
+   * Get current context messages
+   */
+  getMessages(): ChatMessage[] {
+    return this.context.messages;
+  }
+
+  /**
+   * Replace messages (used for context compression)
+   */
+  setMessages(messages: ChatMessage[]): void {
+    this.context.messages = messages;
+  }
+
+  /**
    * Create a new engine instance that shares global dependencies AND conversation context.
    * Used for QQ multi-session with shared memory.
    * 

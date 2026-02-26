@@ -13,8 +13,7 @@ import type {
 } from './types.js';
 import { COMPACTION_STRATEGIES, type KeyFact } from './types.js';
 import { countConversationTokens, countMessageTokens, TOKEN_CONFIG } from './tokens.js';
-import { pruneMessages, emergencyPrune } from './pruner.js';
-import { aiMediumCompaction, aiHeavyCompaction } from './ai-summarizer.js';
+import { aiMediumCompaction, aiHeavyCompaction, aiLightCompaction, aiEmergencyCompaction } from './ai-summarizer.js';
 
 /**
  * Simple summarization without AI (for fallback)
@@ -205,7 +204,88 @@ export async function heavyCompaction(
 }
 
 /**
+ * Light compression - AI-powered gentle summarization
+ * Preserves more context, only summarizes very old messages
+ */
+export async function lightCompaction(
+  messages: ChatMessage[],
+  targetTokens: number = TOKEN_CONFIG.targetTokensAfterCompression,
+  aiClient?: { chatCompletion: (messages: ChatMessage[], tools?: any[]) => Promise<any> }
+): Promise<CompactionResult> {
+  const { total: originalTokens } = countConversationTokens(messages);
+  
+  // Use AI for gentle summarization
+  const { summaryMessage, keptMessages, summaryBlocks } = await aiLightCompaction(
+    messages,
+    targetTokens,
+    aiClient
+  );
+  
+  // Combine summary with kept messages
+  const finalMessages = [summaryMessage, ...keptMessages.filter(m => m.role !== 'system')];
+  const { total: compressedTokens } = countConversationTokens(finalMessages);
+  
+  // Calculate removed indices (all non-system messages that were summarized)
+  const keptSet = new Set(keptMessages);
+  const removedIndices = messages
+    .map((_, idx) => idx)
+    .filter(idx => !keptSet.has(messages[idx]) && messages[idx].role !== 'system');
+  
+  return {
+    level: 'light',
+    originalMessages: messages.length,
+    compressedMessages: finalMessages.length,
+    originalTokens,
+    compressedTokens,
+    removedIndices,
+    summarizedBlocks: summaryBlocks,
+    success: compressedTokens <= targetTokens * 1.2,
+  };
+}
+
+/**
+ * Emergency compression - AI-powered minimalist summarization
+ * Used when context is at critical level
+ */
+export async function emergencyCompaction(
+  messages: ChatMessage[],
+  maxTokens: number = TOKEN_CONFIG.maxHistoryTokens,
+  aiClient?: { chatCompletion: (messages: ChatMessage[], tools?: any[]) => Promise<any> }
+): Promise<CompactionResult> {
+  const { total: originalTokens } = countConversationTokens(messages);
+  
+  // Use AI for minimalist summarization
+  const { summaryMessage, keptMessages, summaryBlocks } = await aiEmergencyCompaction(
+    messages,
+    maxTokens,
+    aiClient
+  );
+  
+  // Combine summary with kept messages
+  const finalMessages = [summaryMessage, ...keptMessages.filter(m => m.role !== 'system')];
+  const { total: compressedTokens } = countConversationTokens(finalMessages);
+  
+  // Calculate removed indices
+  const keptSet = new Set(keptMessages);
+  const removedIndices = messages
+    .map((_, idx) => idx)
+    .filter(idx => !keptSet.has(messages[idx]) && messages[idx].role !== 'system');
+  
+  return {
+    level: 'emergency',
+    originalMessages: messages.length,
+    compressedMessages: finalMessages.length,
+    originalTokens,
+    compressedTokens,
+    removedIndices,
+    summarizedBlocks: summaryBlocks,
+    success: compressedTokens <= maxTokens,
+  };
+}
+
+/**
  * Main compaction function - chooses appropriate strategy
+ * ALL levels now use AI-powered summarization (no message deletion)
  */
 export async function compactContext(
   messages: ChatMessage[],
@@ -230,7 +310,7 @@ export async function compactContext(
       };
     
     case 'light':
-      return pruneMessages(messages, targetTokens, strategy.rules);
+      return lightCompaction(messages, targetTokens, aiClient);
     
     case 'medium':
       return mediumCompaction(messages, targetTokens, aiClient);
@@ -239,21 +319,22 @@ export async function compactContext(
       return heavyCompaction(messages, targetTokens, aiClient);
     
     case 'emergency':
-      return emergencyPrune(messages, strategy.maxTokens, strategy.rules.minMessagesToKeep);
+      return emergencyCompaction(messages, strategy.maxTokens, aiClient);
     
     default:
-      return pruneMessages(messages, targetTokens, strategy.rules);
+      return lightCompaction(messages, targetTokens, aiClient);
   }
 }
 
 /**
  * Incremental compaction - try levels progressively
+ * ALL levels now use AI-powered summarization (no message deletion)
  * New thresholds:
  * - <=50%: No compaction
- * - 50-70%: Light compression (pruning)
+ * - 50-70%: Light compression (AI gentle summarization)
  * - 70-85%: Medium compression (AI summarization)
  * - 85-100%: Heavy compression (AI aggressive summarization)
- * - >=100%: Emergency pruning
+ * - >=100%: Emergency compression (AI minimalist summarization)
  */
 export async function incrementalCompaction(
   messages: ChatMessage[],
@@ -277,21 +358,21 @@ export async function incrementalCompaction(
     };
   }
 
-  // Light compression at 50-70%
+  // Light compression at 50-70% (AI gentle summarization)
   if (percentage <= 0.7) {
-    return pruneMessages(messages, TOKEN_CONFIG.targetTokensAfterCompression, COMPACTION_STRATEGIES.light.rules);
+    return lightCompaction(messages, TOKEN_CONFIG.targetTokensAfterCompression, aiClient);
   }
 
-  // Medium compression at 70-85% (use AI)
+  // Medium compression at 70-85% (AI summarization)
   if (percentage <= 0.85) {
     return mediumCompaction(messages, TOKEN_CONFIG.targetTokensAfterCompression, aiClient);
   }
 
-  // Heavy compression at 85-100% (use AI)
+  // Heavy compression at 85-100% (AI aggressive summarization)
   if (percentage < 1.0) {
     return heavyCompaction(messages, TOKEN_CONFIG.targetTokensAfterCompression * 0.8, aiClient);
   }
 
-  // Emergency pruning at >=100%
-  return emergencyPrune(messages, maxTokens);
+  // Emergency compression at >=100% (AI minimalist summarization)
+  return emergencyCompaction(messages, maxTokens, aiClient);
 }
