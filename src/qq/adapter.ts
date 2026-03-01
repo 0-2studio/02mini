@@ -1467,29 +1467,37 @@ Now process these messages and respond appropriately.`;
    */
   private async compressQQContext(): Promise<void> {
     this.isCompressing = true;
+    console.log('[QQ] Starting context compression...');
 
     try {
-      // Step 1: Extract QQ-related messages and delete them
-      const { extractedMessages, remainingMessages } = this.extractAndDeleteQQMessages();
+      // Step 1: Extract removable messages (everything except system prompts and summary)
+      console.log('[QQ] Step 1: Extracting removable messages...');
+      const { extractedMessages, remainingMessages } = this.extractRemovableMessages();
 
       if (extractedMessages.length === 0) {
-        console.log('[QQ] No QQ messages to compress');
+        console.log('[QQ] No messages to compress');
         return;
       }
 
-      console.log(`[QQ] Extracted ${extractedMessages.length} messages for compression`);
+      console.log(`[QQ] Will compress ${extractedMessages.length} messages into summary`);
+      console.log(`[QQ] Will keep ${remainingMessages.length} messages (system prompts + existing summary)`);
 
       // Step 2: Generate summary with AI
+      console.log('[QQ] Step 2: Generating AI summary...');
       const newSummary = await this.generateQQSummary(extractedMessages);
 
-      // Step 3: Insert new summary into remaining messages
+      // Step 3: Use remaining messages (system prompts + existing summary)
+      // and insert the new summary
+      console.log('[QQ] Step 3: Inserting summary into remaining messages...');
       const messagesWithSummary = this.insertSummaryIntoMessages(remainingMessages, newSummary);
 
       // Step 4: Update engine context
+      console.log('[QQ] Step 4: Updating engine context...');
       this.engine.setMessages(messagesWithSummary);
       this.qqSummaryMessage = newSummary;
 
-      console.log(`[QQ] Context compressed successfully`);
+      console.log(`[QQ] Context compressed successfully!`);
+      console.log(`[QQ] New context has ${messagesWithSummary.length} messages`);
 
       // Step 5: Add buffered messages that arrived during compression
       if (this.pendingQQMessagesDuringCompression.length > 0) {
@@ -1507,38 +1515,59 @@ Now process these messages and respond appropriately.`;
   }
 
   /**
-   * Extract QQ messages from context and return remaining messages
+   * Extract removable messages from context (everything except system prompts and summary)
    * Returns both extracted messages and remaining messages
+   * Note: Does NOT delete from engine immediately - deletion happens in compressQQContext
+   * to avoid race conditions during AI summary generation
    */
-  private extractAndDeleteQQMessages(): { 
+  private extractRemovableMessages(): { 
     extractedMessages: ChatMessage[]; 
     remainingMessages: ChatMessage[] 
   } {
     const messages = this.engine.getMessages();
-    const extracted: ChatMessage[] = [];
-    const remaining: ChatMessage[] = [];
+    const extracted: ChatMessage[] = []; // These will be compressed into summary
+    const remaining: ChatMessage[] = []; // These will be kept (system prompts + existing summary)
 
     for (const msg of messages) {
-      // Check if it's a QQ message
-      if (this.isQQMessage(msg)) {
-        extracted.push(msg);
-      } else {
+      // Keep system prompts (but not QQ messages disguised as system messages)
+      // and keep existing QQ CONTEXT SUMMARY
+      if (this.shouldKeepMessage(msg)) {
         remaining.push(msg);
+      } else {
+        extracted.push(msg);
       }
     }
+
+    console.log(`[QQ] Found ${extracted.length} messages to compress/remove, ${remaining.length} messages will be kept (system prompts + summary)`);
 
     return { extractedMessages: extracted, remainingMessages: remaining };
   }
 
   /**
-   * Check if a message is QQ-related
+   * Determine if a message should be kept (not compressed)
+   * Keeps: system prompts (except QQ messages), QQ CONTEXT SUMMARY
+   * Removes: QQ messages, AI responses, tool results, user inputs
    */
-  private isQQMessage(msg: ChatMessage): boolean {
+  private shouldKeepMessage(msg: ChatMessage): boolean {
     const content = msg.content || '';
-    // QQ messages start with '[QQ' or contain QQ-related markers
-    return content.startsWith('[QQ') || 
-           content.startsWith('[QQ Messages') ||
-           content.includes('[QQ SUMMARY]');
+    
+    // Always keep QQ CONTEXT SUMMARY (it's the compressed result from previous compression)
+    if (content.startsWith('[QQ CONTEXT SUMMARY]')) {
+      return true;
+    }
+    
+    // Keep system prompts that are NOT QQ-related messages
+    // System prompts are role='system' AND don't start with QQ patterns
+    if (msg.role === 'system') {
+      // Check if this is a QQ message disguised as system message
+      if (content.startsWith('[QQ Messages') || content.startsWith('[QQ]')) {
+        return false; // This is actually a QQ message, not a real system prompt
+      }
+      return true; // Real system prompt, keep it
+    }
+    
+    // Everything else (user messages, assistant responses, tool results) should be removed
+    return false;
   }
 
   /**
@@ -1546,6 +1575,8 @@ Now process these messages and respond appropriately.`;
    */
   private async generateQQSummary(messages: ChatMessage[]): Promise<string> {
     const aiClient = this.engine.getAIClient();
+    
+    console.log(`[QQ] Calling AI to generate summary for ${messages.length} messages...`);
     
     // Build the conversation text for AI
     const conversationText = messages.map((msg, idx) => {
@@ -1568,8 +1599,10 @@ Now process these messages and respond appropriately.`;
 
 ${conversationText}
 
-Provide your summary in this format:
-[QQ SUMMARY]
+IMPORTANT: Start your response with "[QQ CONTEXT SUMMARY]" (not "[QQ SUMMARY]")
+
+Format:
+[QQ CONTEXT SUMMARY]
 - Participants: [list users/groups involved]
 - Recent Topics: [what was discussed]
 - Key Information: [important facts, user preferences, pending tasks]
@@ -1580,6 +1613,7 @@ Be concise but ensure important details are preserved.`,
     ];
 
     try {
+      console.log('[QQ] Waiting for AI response...');
       // Use globalApiLock to avoid conflicts with other AI calls
       const response = await globalApiLock.withLock(() =>
         aiClient.chatCompletion(summaryPrompt)
@@ -1587,14 +1621,22 @@ Be concise but ensure important details are preserved.`,
 
       if (response?.choices?.[0]?.message?.content) {
         const summary = response.choices[0].message.content;
-        console.log(`[QQ] Generated summary (${summary.length} chars)`);
+        console.log(`[QQ] AI generated summary successfully (${summary.length} chars)`);
+        // Ensure summary starts with [QQ CONTEXT SUMMARY] (not just [QQ SUMMARY])
+        // This prevents it from being recognized as a QQ message to compress
+        if (!summary.startsWith('[QQ CONTEXT SUMMARY]')) {
+          return `[QQ CONTEXT SUMMARY]\n${summary}`;
+        }
         return summary;
+      } else {
+        console.log('[QQ] AI response empty, using fallback');
       }
     } catch (error) {
-      console.error('[QQ] Failed to generate summary:', error);
+      console.error('[QQ] AI call failed for summary:', error);
     }
 
     // Fallback: create simple summary
+    console.log('[QQ] Using fallback simple summary');
     const userCount = new Set(messages.filter(m => m.role === 'user').map(m => m.content?.split(':')[0])).size;
     return `[QQ SUMMARY] Conversation with ${userCount} users, ${messages.length} messages total. [Details omitted due to compression error]`;
   }
