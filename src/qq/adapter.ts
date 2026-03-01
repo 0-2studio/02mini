@@ -1470,25 +1470,27 @@ Now process these messages and respond appropriately.`;
     console.log('[QQ] Starting context compression...');
 
     try {
-      // Step 1: Extract removable messages (everything except system prompts and summary)
-      console.log('[QQ] Step 1: Extracting removable messages...');
-      const { extractedMessages, remainingMessages } = this.extractRemovableMessages();
+      // Step 1: Extract removable messages and separate old summary
+      console.log('[QQ] Step 1: Extracting removable messages and old summary...');
+      const { extractedMessages, remainingMessages, oldSummary } = this.extractRemovableMessages();
 
-      if (extractedMessages.length === 0) {
+      if (extractedMessages.length === 0 && !oldSummary) {
         console.log('[QQ] No messages to compress');
         return;
       }
 
-      console.log(`[QQ] Will compress ${extractedMessages.length} messages into summary`);
-      console.log(`[QQ] Will keep ${remainingMessages.length} messages (system prompts + existing summary)`);
+      console.log(`[QQ] Will compress ${extractedMessages.length} new messages`);
+      if (oldSummary) {
+        console.log(`[QQ] Will merge with existing summary (${oldSummary.length} chars)`);
+      }
+      console.log(`[QQ] Will keep ${remainingMessages.length} system prompts`);
 
-      // Step 2: Generate summary with AI
-      console.log('[QQ] Step 2: Generating AI summary...');
-      const newSummary = await this.generateQQSummary(extractedMessages);
+      // Step 2: Generate merged summary with AI
+      console.log('[QQ] Step 2: Generating merged AI summary...');
+      const newSummary = await this.generateQQSummary(extractedMessages, oldSummary);
 
-      // Step 3: Use remaining messages (system prompts + existing summary)
-      // and insert the new summary
-      console.log('[QQ] Step 3: Inserting summary into remaining messages...');
+      // Step 3: Insert new summary into remaining messages (only system prompts)
+      console.log('[QQ] Step 3: Inserting merged summary...');
       const messagesWithSummary = this.insertSummaryIntoMessages(remainingMessages, newSummary);
 
       // Step 4: Update engine context
@@ -1515,45 +1517,53 @@ Now process these messages and respond appropriately.`;
   }
 
   /**
-   * Extract removable messages from context (everything except system prompts and summary)
-   * Returns both extracted messages and remaining messages
+   * Extract removable messages from context (everything except system prompts)
+   * Also extracts old summary separately for merging
    * Note: Does NOT delete from engine immediately - deletion happens in compressQQContext
    * to avoid race conditions during AI summary generation
    */
   private extractRemovableMessages(): { 
     extractedMessages: ChatMessage[]; 
-    remainingMessages: ChatMessage[] 
+    remainingMessages: ChatMessage[];
+    oldSummary: string | null;
   } {
     const messages = this.engine.getMessages();
     const extracted: ChatMessage[] = []; // These will be compressed into summary
-    const remaining: ChatMessage[] = []; // These will be kept (system prompts + existing summary)
+    const remaining: ChatMessage[] = []; // These will be kept (system prompts only)
+    let oldSummary: string | null = null; // Existing summary to be merged
 
     for (const msg of messages) {
-      // Keep system prompts (but not QQ messages disguised as system messages)
-      // and keep existing QQ CONTEXT SUMMARY
-      if (this.shouldKeepMessage(msg)) {
-        remaining.push(msg);
+      const content = msg.content || '';
+      
+      // Check if this is an existing summary
+      if (this.isExistingSummary(msg)) {
+        oldSummary = content; // Save old summary for merging
+        // Don't add to remaining, it will be replaced by new merged summary
+      } else if (this.shouldKeepMessage(msg)) {
+        remaining.push(msg); // Keep system prompts
       } else {
-        extracted.push(msg);
+        extracted.push(msg); // Extract QQ messages, AI responses, etc.
       }
     }
 
-    console.log(`[QQ] Found ${extracted.length} messages to compress/remove, ${remaining.length} messages will be kept (system prompts + summary)`);
+    console.log(`[QQ] Found ${extracted.length} messages to compress, old summary: ${oldSummary ? 'yes' : 'none'}, keeping ${remaining.length} system prompts`);
 
-    return { extractedMessages: extracted, remainingMessages: remaining };
+    return { extractedMessages: extracted, remainingMessages: remaining, oldSummary };
   }
 
   /**
    * Determine if a message should be kept (not compressed)
-   * Keeps: system prompts (except QQ messages), QQ CONTEXT SUMMARY
-   * Removes: QQ messages, AI responses, tool results, user inputs
+   * Keeps: system prompts (except QQ messages and old summaries)
+   * Removes: QQ messages, AI responses, tool results, user inputs, OLD summaries
+   * Note: Old summaries will be extracted and given to AI for merging
    */
   private shouldKeepMessage(msg: ChatMessage): boolean {
     const content = msg.content || '';
     
-    // Always keep QQ CONTEXT SUMMARY (it's the compressed result from previous compression)
-    if (content.startsWith('[QQ CONTEXT SUMMARY]')) {
-      return true;
+    // Remove OLD QQ CONTEXT SUMMARY (it will be extracted separately and merged by AI)
+    // We only want to keep the NEW summary after compression
+    if (content.startsWith('[QQ CONTEXT SUMMARY]') || content.startsWith('[QQ SUMMARY]')) {
+      return false; // Remove old summary, AI will create a merged one
     }
     
     // Keep system prompts that are NOT QQ-related messages
@@ -1571,12 +1581,24 @@ Now process these messages and respond appropriately.`;
   }
 
   /**
-   * Generate QQ context summary using AI
+   * Check if a message is an existing summary
    */
-  private async generateQQSummary(messages: ChatMessage[]): Promise<string> {
+  private isExistingSummary(msg: ChatMessage): boolean {
+    const content = msg.content || '';
+    return content.startsWith('[QQ CONTEXT SUMMARY]') || content.startsWith('[QQ SUMMARY]');
+  }
+
+  /**
+   * Generate QQ context summary using AI
+   * If oldSummary is provided, merge it with new messages
+   */
+  private async generateQQSummary(messages: ChatMessage[], oldSummary: string | null = null): Promise<string> {
     const aiClient = this.engine.getAIClient();
     
     console.log(`[QQ] Calling AI to generate summary for ${messages.length} messages...`);
+    if (oldSummary) {
+      console.log(`[QQ] Merging with existing summary...`);
+    }
     
     // Build the conversation text for AI
     const conversationText = messages.map((msg, idx) => {
@@ -1588,14 +1610,33 @@ Now process these messages and respond appropriately.`;
       return `[${idx}] ${content}`;
     }).join('\n\n');
 
-    const summaryPrompt: ChatMessage[] = [
-      {
-        role: 'system',
-        content: 'You are summarizing QQ conversation context for compression. Create a concise but comprehensive summary.',
-      },
-      {
-        role: 'user',
-        content: `Please summarize the following QQ conversation history:
+    // Build prompt based on whether we have an old summary to merge
+    let userPrompt: string;
+    if (oldSummary) {
+      userPrompt = `Please create a MERGED summary combining the PREVIOUS SUMMARY with the NEW QQ messages below.
+
+PREVIOUS SUMMARY:
+${oldSummary}
+
+NEW QQ MESSAGES TO MERGE:
+${conversationText}
+
+IMPORTANT: 
+- Start your response with "[QQ CONTEXT SUMMARY]" (not "[QQ SUMMARY]")
+- Create a SINGLE unified summary that includes information from both the previous summary and new messages
+- Update any changed information (e.g., if user preferences changed)
+- Keep the summary concise but comprehensive
+
+Format:
+[QQ CONTEXT SUMMARY]
+- Participants: [list all users/groups involved, old and new]
+- Recent Topics: [what was discussed in new messages]
+- Key Information: [important facts, user preferences, pending tasks - MERGED from old and new]
+- Historical Context: [ongoing conversations from old summary + updates from new]
+
+Be concise but ensure NO important details are lost in the merge.`;
+    } else {
+      userPrompt = `Please summarize the following QQ conversation history:
 
 ${conversationText}
 
@@ -1608,7 +1649,19 @@ Format:
 - Key Information: [important facts, user preferences, pending tasks]
 - Context: [ongoing conversations or relationships]
 
-Be concise but ensure important details are preserved.`,
+Be concise but ensure important details are preserved.`;
+    }
+
+    const summaryPrompt: ChatMessage[] = [
+      {
+        role: 'system',
+        content: oldSummary 
+          ? 'You are merging an existing QQ conversation summary with new messages. Create a unified, comprehensive summary.'
+          : 'You are summarizing QQ conversation context for compression. Create a concise but comprehensive summary.',
+      },
+      {
+        role: 'user',
+        content: userPrompt,
       },
     ];
 
@@ -1643,25 +1696,29 @@ Be concise but ensure important details are preserved.`,
 
   /**
    * Insert summary into messages (as system message at appropriate position)
+   * Ensures only ONE summary exists - any old summaries are filtered out
    */
   private insertSummaryIntoMessages(messages: ChatMessage[], summary: string): ChatMessage[] {
+    // Filter out any old summaries from messages (safety check)
+    const filteredMessages = messages.filter(msg => !this.isExistingSummary(msg));
+    
     // Find position after system prompts but before user messages
     let insertIndex = 0;
-    for (let i = 0; i < messages.length; i++) {
-      if (messages[i].role === 'system') {
+    for (let i = 0; i < filteredMessages.length; i++) {
+      if (filteredMessages[i].role === 'system') {
         insertIndex = i + 1;
       } else {
         break;
       }
     }
 
-    // Insert summary as system message
+    // Insert new summary as system message
     const summaryMessage: ChatMessage = {
       role: 'system',
       content: summary,
     };
 
-    const result = [...messages];
+    const result = [...filteredMessages];
     result.splice(insertIndex, 0, summaryMessage);
     return result;
   }

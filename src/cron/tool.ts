@@ -216,12 +216,18 @@ export async function executeCronTool(
             message: 'Job ID is required to remove a job. First use "list" action to get the job ID, then use that ID with "remove" action. Example: {"action":"list"} → find id → {"action":"remove","jobId":"the-uuid"}' 
           };
         }
-        
-        const removed = await scheduler.removeJob(params.jobId);
-        if (!removed) {
+
+        const existing = scheduler.getJob(params.jobId);
+        if (!existing) {
           return { success: false, message: `Job ${params.jobId} not found. Use "list" action to see available jobs and their IDs.` };
         }
-        return { success: true, message: `Removed job "${removed.name}" (ID: ${params.jobId})` };
+
+        const ok = await scheduler.removeJob(params.jobId);
+        if (!ok) {
+          return { success: false, message: `Job ${params.jobId} not found. Use "list" action to see available jobs and their IDs.` };
+        }
+
+        return { success: true, message: `Removed job "${existing.name}" (ID: ${params.jobId})` };
       }
 
       case 'run': {

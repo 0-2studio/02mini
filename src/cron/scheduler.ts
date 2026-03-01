@@ -230,10 +230,20 @@ export class CronScheduler extends EventEmitter {
     const jobs = this.store.getAllJobs().filter(j => j.enabled);
     const now = Date.now();
 
+    // If any enabled job is already due (or overdue), wake immediately.
+    // This prevents "stuck" states where all nextRunAtMs are <= now and the
+    // scheduler would otherwise sleep for 60s.
+    for (const job of jobs) {
+      const jobNext = job.state.nextRunAtMs;
+      if (jobNext !== undefined && jobNext <= now) {
+        return now;
+      }
+    }
+
     let nextTime: number | undefined;
     for (const job of jobs) {
       const jobNext = job.state.nextRunAtMs;
-      if (jobNext && jobNext > now) {
+      if (jobNext !== undefined && jobNext > now) {
         if (!nextTime || jobNext < nextTime) {
           nextTime = jobNext;
         }
@@ -349,15 +359,27 @@ export class CronScheduler extends EventEmitter {
    */
   async addJob(create: CronJobCreate): Promise<CronJob> {
     const id = `job_${Date.now()}_${Math.random().toString(36).slice(2, 9)}`;
-    const now = new Date().toISOString();
-    
+    const nowIso = new Date().toISOString();
+    const nowMs = Date.now();
+
+    // Normalize schedule (e.g., set anchor for "every" to prevent drift)
+    const normalizedSchedule: CronSchedule =
+      create.schedule.kind === 'every'
+        ? {
+            ...create.schedule,
+            anchorMs: create.schedule.anchorMs ?? nowMs,
+          }
+        : create.schedule;
+
     const job: CronJob = {
       id,
       name: create.name,
       description: create.description || '',
       enabled: create.enabled ?? true,
-      deleteAfterRun: create.deleteAfterRun ?? false,
-      schedule: create.schedule,
+      // Default: "at" schedules are one-time and should delete after run.
+      deleteAfterRun:
+        create.deleteAfterRun ?? (normalizedSchedule.kind === 'at' ? true : false),
+      schedule: normalizedSchedule,
       sessionTarget: create.sessionTarget || 'main',
       wakeMode: create.wakeMode || 'now',
       payload: create.payload,
@@ -367,14 +389,9 @@ export class CronScheduler extends EventEmitter {
         errorCount: 0,
         consecutiveErrors: 0,
       },
-      createdAt: now,
-      updatedAt: now,
+      createdAt: nowIso,
+      updatedAt: nowIso,
     };
-
-    // Auto-set deleteAfterRun for 'at' schedule (one-time tasks)
-    if (job.schedule.kind === 'at' && job.deleteAfterRun !== false) {
-      job.deleteAfterRun = true;
-    }
 
     // Compute initial next run
     const nextRun = this.computeNextRun(job.schedule);
@@ -400,6 +417,16 @@ export class CronScheduler extends EventEmitter {
 
     // If schedule changed, recompute next run
     if (updates.schedule) {
+      // Normalize schedule updates (e.g., keep/set anchor for "every")
+      if (updates.schedule.kind === 'every') {
+        const existingAnchor =
+          existing.schedule.kind === 'every' ? existing.schedule.anchorMs : undefined;
+        updates.schedule = {
+          ...updates.schedule,
+          anchorMs: updates.schedule.anchorMs ?? existingAnchor ?? Date.now(),
+        };
+      }
+
       const nextRun = this.computeNextRun(updates.schedule);
       updates.state = { ...existing.state, nextRunAtMs: nextRun };
     }
