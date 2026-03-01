@@ -28,7 +28,7 @@
 
 ```bash
 # 克隆仓库
-git clone https://github.com/your-username/02mini.git
+git clone https://github.com/0-2studio/02mini.git
 cd 02mini
 
 # 安装依赖
