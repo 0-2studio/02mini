@@ -5,25 +5,26 @@
 
 import type { QQAdapter } from './adapter.js';
 import type { QQConfigManager } from './config.js';
-
-export interface QQToolResult {
-  success: boolean;
-  message: string;
-}
+import type { QQToolResult } from './types.js';
 
 export function createQQTools(adapter: QQAdapter, _configManager: QQConfigManager) {
   return {
     type: 'function' as const,
     function: {
       name: 'qq',
-      description: `Send/receive messages and files to/from QQ users or groups.
+      description: `Send/receive messages, files, and media to/from QQ users or groups.
 
 ACTIONS:
 - send_private_message: Send DM to a QQ user (requires user_id, NOT group_id)
 - send_group_message: Send message to a QQ group (requires group_id, NOT user_id)
 - send_file: Send a file to user or group
-- receive_file: Download a received file to files/qq-uploads/
+- receive_file: Download a received FILE (pdf/doc/zip - NOT images) to files/qq-uploads/
 - list_pending_files: List files waiting to be received
+- get_image: Get/view an IMAGE (.jpg/.png - use MULTIMODAL, you'll "see" it directly)
+
+⚠️ IMAGE vs FILE - DO NOT CONFUSE:
+- For PHOTOS/IMAGES → Use "get_image" (multimodal, you see it directly)
+- For PDF/DOC/ZIP files → Use "receive_file" (download first, then read)
 
 IMPORTANT - ID PARAMETERS:
 - send_private_message: ONLY use user_id, do NOT include group_id
@@ -41,14 +42,22 @@ SEND FILE:
 - file_path: Absolute path to file
 - file_name: Optional display name
 
-RECEIVE FILE:
+RECEIVE FILE (NOT FOR IMAGES):
 - action: "receive_file"
-- file_id: The file ID from message or pending files list
+- file_id: The file ID from [File detected] message
+- Use ONLY for real files (pdf, doc, zip), NEVER for images
 - Files are saved to: files/qq-uploads/YYYY-MM-DD/
 
 LIST PENDING FILES:
 - action: "list_pending_files"
 - Shows files sent by users that haven't been downloaded yet
+
+GET IMAGE (Multimodal):
+- action: "get_image"
+- file_id: The image file name shown in message (e.g., "xxx.jpg")
+- group_id: Required if image is from a group
+- The image will be sent to you in multimodal format - you'll "see" it
+- Note: Images expire after 5 minutes
 
 @ MENTIONS (CQ CODE FORMAT):
 - To @ mention someone, include [CQ:at,qq=xxx] in the message text, where xxx is the QQ user ID (QQ号)
@@ -75,13 +84,14 @@ With @ mention: {"action":"send_group_message","group_id":789,"message":"Hello [
 Send file to group: {"action":"send_file","group_id":789,"file_path":"files/report.pdf","end":true}
 Send file to user: {"action":"send_file","user_id":123456,"file_path":"files/report.pdf","end":true}
 Receive file: {"action":"receive_file","file_id":"abc123","end":true}
-List files: {"action":"list_pending_files","end":false}`,
+List files: {"action":"list_pending_files","end":false}
+Get image from group: {"action":"get_image","file_id":"xxx.jpg","group_id":789}`,
       parameters: {
         type: 'object',
         properties: {
           action: {
             type: 'string',
-            enum: ['send_private_message', 'send_group_message', 'send_file', 'receive_file', 'list_pending_files'],
+            enum: ['send_private_message', 'send_group_message', 'send_file', 'receive_file', 'list_pending_files', 'get_image'],
             description: 'Action type',
           },
           user_id: {
@@ -106,7 +116,7 @@ List files: {"action":"list_pending_files","end":false}`,
           },
           file_id: {
             type: 'string',
-            description: 'File ID for receive_file action',
+            description: 'File ID for receive_file, or image file name for get_image action',
           },
           end: {
             type: 'boolean',
@@ -245,6 +255,29 @@ export async function executeQQTool(
       }
       const fileList = pendingFiles.map(f => `- ${f.fileName} (${f.fileSize} bytes) - ID: ${f.fileId}`).join('\n');
       return { success: true, message: `Pending files:\n${fileList}\n\nUse receive_file with file_id to download.` };
+    }
+
+    // Handle get_image action (multimodal)
+    if (params.action === 'get_image') {
+      if (!params.file_id) {
+        return {
+          success: false,
+          message: 'Error: file_id is required for get_image\n\nCORRECT USAGE: {"action":"get_image","file_id":"xxx","group_id":123}'
+        };
+      }
+      const multimodalContent = await adapter.getImageForAI(params.file_id, params.group_id, params.user_id);
+      if (multimodalContent) {
+        // Return as JSON string with strong reminder not to download
+        const resultMessage = `[IMAGE RETRIEVED] The image has been successfully transmitted to your multimodal context via the get_image tool. You can NOW see the image directly. DO NOT use any download tools, code-runner, or filesystem tools. The image is ALREADY visible to you. Describe what you see in the image immediately.`;
+        return {
+          success: true,
+          message: resultMessage,
+          isMultimodal: true,
+          multimodalData: JSON.stringify(multimodalContent) // Separate field for actual data
+        };
+      } else {
+        return { success: false, message: `Error: Image not found or expired: ${params.file_id}. Images expire after 5 minutes.` };
+      }
     }
 
     // Handle send actions

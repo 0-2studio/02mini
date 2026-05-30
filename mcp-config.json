@@ -2,11 +2,11 @@
   "mcpServers": {
     "filesystem": {
       "command": "npx",
-      "args": ["-y", "@modelcontextprotocol/server-filesystem", "."]
+      "args": ["-y", "@modelcontextprotocol/server-filesystem@latest", "."]
     },
     "fetch": {
       "command": "npx",
-      "args": ["mcp-fetch-server"],
+      "args": ["-y", "mcp-fetch-server@1.1.2"],
       "env": {
         "DEFAULT_LIMIT": "50000"
       }
@@ -15,7 +15,7 @@
       "command": "npx",
       "args": [
         "-y",
-        "@iflow-mcp/mcp-server-code-runner"
+        "@iflow-mcp/mcp-server-code-runner@latest"
       ],
       "values": {}
     }

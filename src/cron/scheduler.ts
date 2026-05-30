@@ -75,6 +75,7 @@ export class CronScheduler extends EventEmitter {
    * Compute next run time for a schedule
    */
   computeNextRun(schedule: CronSchedule, fromMs: number = Date.now()): number | undefined {
+    this.validateSchedule(schedule);
     switch (schedule.kind) {
       case 'at': {
         const atMs = new Date(schedule.at).getTime();
@@ -102,7 +103,7 @@ export class CronScheduler extends EventEmitter {
    * Compute next run for cron expression (simplified)
    * Supports basic cron expressions: "* * * * *" (minute hour day month weekday)
    */
-  private computeNextCronRun(expr: string, tz: string = 'Asia/Shanghai', fromMs: number): number | undefined {
+  private computeNextCronRun(expr: string, _tz: string | undefined, fromMs: number): number | undefined {
     const parts = expr.trim().split(/\s+/);
     if (parts.length !== 5) {
       console.error(`[CronScheduler] Invalid cron expression: ${expr}`);
@@ -174,6 +175,57 @@ export class CronScheduler extends EventEmitter {
     // Single value
     const num = parseInt(expr, 10);
     return value === num;
+  }
+
+  private validateSchedule(schedule: CronSchedule): void {
+    if (schedule.kind === 'every') {
+      if (!Number.isFinite(schedule.everyMs) || schedule.everyMs < 1000) {
+        throw new Error('everyMs must be at least 1000');
+      }
+    }
+    if (schedule.kind === 'at') {
+      if (Number.isNaN(new Date(schedule.at).getTime())) {
+        throw new Error(`Invalid at schedule: ${schedule.at}`);
+      }
+    }
+    if (schedule.kind === 'cron') {
+      const parts = schedule.expr.trim().split(/\s+/);
+      if (parts.length !== 5) throw new Error(`Invalid cron expression: ${schedule.expr}`);
+      this.validateCronPart(parts[0], 0, 59);
+      this.validateCronPart(parts[1], 0, 23);
+      this.validateCronPart(parts[2], 1, 31);
+      this.validateCronPart(parts[3], 1, 12);
+      this.validateCronPart(parts[4], 0, 6);
+    }
+  }
+
+  private validateCronPart(expr: string, min: number, max: number): void {
+    const validateNumber = (raw: string) => {
+      const value = Number(raw);
+      if (!Number.isInteger(value) || value < min || value > max) {
+        throw new Error(`Invalid cron value '${raw}' for range ${min}-${max}`);
+      }
+      return value;
+    };
+
+    for (const part of expr.split(',')) {
+      if (part === '*') continue;
+      if (part.startsWith('*/')) {
+        const step = Number(part.slice(2));
+        if (!Number.isInteger(step) || step <= 0) {
+          throw new Error(`Invalid cron step '${part}'`);
+        }
+        continue;
+      }
+      if (part.includes('-')) {
+        const [startRaw, endRaw] = part.split('-');
+        const start = validateNumber(startRaw);
+        const end = validateNumber(endRaw);
+        if (start > end) throw new Error(`Invalid cron range '${part}'`);
+        continue;
+      }
+      validateNumber(part);
+    }
   }
 
   /**
@@ -342,7 +394,7 @@ export class CronScheduler extends EventEmitter {
       await this.store.markJobRun(job.id, false, errorMsg);
 
       // Apply error backoff
-      const backoffIndex = Math.min(job.state.consecutiveErrors, ERROR_BACKOFF_MS.length - 1);
+      const backoffIndex = Math.min(Math.max(0, job.state.consecutiveErrors - 1), ERROR_BACKOFF_MS.length - 1);
       const backoffMs = ERROR_BACKOFF_MS[backoffIndex];
       const retryAt = Date.now() + backoffMs;
 
@@ -415,23 +467,25 @@ export class CronScheduler extends EventEmitter {
     const existing = this.store.getJob(id);
     if (!existing) return null;
 
+    const patch: Partial<CronJob> = { ...updates };
+
     // If schedule changed, recompute next run
     if (updates.schedule) {
       // Normalize schedule updates (e.g., keep/set anchor for "every")
       if (updates.schedule.kind === 'every') {
         const existingAnchor =
           existing.schedule.kind === 'every' ? existing.schedule.anchorMs : undefined;
-        updates.schedule = {
+        patch.schedule = {
           ...updates.schedule,
           anchorMs: updates.schedule.anchorMs ?? existingAnchor ?? Date.now(),
         };
       }
 
-      const nextRun = this.computeNextRun(updates.schedule);
-      updates.state = { ...existing.state, nextRunAtMs: nextRun };
+      const nextRun = this.computeNextRun(patch.schedule as CronSchedule);
+      patch.state = { ...existing.state, nextRunAtMs: nextRun };
     }
 
-    const updated = await this.store.updateJob(id, updates);
+    const updated = await this.store.updateJob(id, patch);
     if (updated) {
       this.emit('job:updated', updated);
       this.armTimer();
@@ -471,8 +525,14 @@ export class CronScheduler extends EventEmitter {
   async runJobNow(id: string): Promise<boolean> {
     const job = this.store.getJob(id);
     if (!job) return false;
+    if (this.executingJobs.has(id)) return false;
 
-    await this.executeJob(job);
+    this.executingJobs.add(id);
+    try {
+      await this.executeJob(job);
+    } finally {
+      this.executingJobs.delete(id);
+    }
     return true;
   }
 
@@ -499,5 +559,9 @@ export class CronScheduler extends EventEmitter {
       jobs: this.store.getAllJobs().length,
       nextRun: this.getNextWakeTime(),
     };
+  }
+
+  getExecutingJobs(): string[] {
+    return Array.from(this.executingJobs);
   }
 }

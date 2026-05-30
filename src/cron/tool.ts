@@ -39,8 +39,8 @@ SCHEDULE TYPES:
 2. "every": Recurring interval in milliseconds
    Example: {"kind": "every", "everyMs": 60000}  // Every minute
    
-3. "cron": Cron expression (minute hour day month weekday)
-   Example: {"kind": "cron", "expr": "0 9 * * *", "tz": "Asia/Shanghai"}
+3. "cron": Cron expression using host local time (minute hour day month weekday)
+   Example: {"kind": "cron", "expr": "0 9 * * *"}
    - * = any value
    - */5 = every 5 units
    - 1-5 = range
@@ -85,7 +85,6 @@ EXAMPLES:
                   at: { type: 'string', description: 'ISO timestamp for "at" schedule' },
                   everyMs: { type: 'number', description: 'Interval in ms for "every" schedule' },
                   expr: { type: 'string', description: 'Cron expression for "cron" schedule' },
-                  tz: { type: 'string', description: 'Timezone for "cron" schedule (default: Asia/Shanghai)' },
                 },
               },
               sessionTarget: { type: 'string', enum: ['main', 'isolated'], description: 'Where to run (default: main)' },

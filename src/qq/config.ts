@@ -91,8 +91,13 @@ export class QQConfigManager {
     }
 
     if (env.QQ_PORT) {
-      this.config.port = parseInt(env.QQ_PORT, 10);
-      hasEnvConfig = true;
+      const port = parseInt(env.QQ_PORT, 10);
+      if (Number.isInteger(port) && port >= 1 && port <= 65535) {
+        this.config.port = port;
+        hasEnvConfig = true;
+      } else {
+        console.error(`[QQ] Invalid QQ_PORT ignored: ${env.QQ_PORT}`);
+      }
     }
 
     if (env.QQ_HOST) {
@@ -106,8 +111,12 @@ export class QQConfigManager {
     }
 
     if (env.QQ_MODE) {
-      this.config.mode = env.QQ_MODE as 'websocket-server' | 'websocket-client';
-      hasEnvConfig = true;
+      if (env.QQ_MODE === 'websocket-server' || env.QQ_MODE === 'websocket-client') {
+        this.config.mode = env.QQ_MODE;
+        hasEnvConfig = true;
+      } else {
+        console.error(`[QQ] Invalid QQ_MODE ignored: ${env.QQ_MODE}`);
+      }
     }
 
     if (env.QQ_AT_REQUIRED !== undefined) {
@@ -127,9 +136,11 @@ export class QQConfigManager {
 
     if (env.QQ_ACCUMULATION_DELAY) {
       const delay = parseInt(env.QQ_ACCUMULATION_DELAY, 10);
-      if (!isNaN(delay) && delay >= 0) {
+      if (!isNaN(delay) && delay >= 0 && delay <= 60_000) {
         this.config.accumulationDelay = delay;
         hasEnvConfig = true;
+      } else {
+        console.error(`[QQ] Invalid QQ_ACCUMULATION_DELAY ignored: ${env.QQ_ACCUMULATION_DELAY}`);
       }
     }
 
@@ -187,6 +198,10 @@ export class QQConfigManager {
     if (this.permissions.blockedUsers.has(userId)) return false;
     if (this.permissions.allowAllPrivate) return true;
     return this.permissions.allowedUsers.has(userId);
+  }
+
+  isUserBlocked(userId: number): boolean {
+    return this.permissions.blockedUsers.has(userId);
   }
 
   /**

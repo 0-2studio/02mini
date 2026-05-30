@@ -9,6 +9,7 @@ import fs from 'fs/promises';
 import path from 'path';
 import type { CoreEngine } from '../core/engine.js';
 import { stripMessageMarker } from '../core/engine.js';
+import { contentToText } from '../context/content.js';
 import { Semaphore } from '../ai/semaphore.js';
 import { globalApiLock } from '../ai/api-lock.js';
 import type { QQConfigManager } from './config.js';
@@ -21,6 +22,8 @@ import type {
   QQContext,
   QQSession,
   QQFileInfo,
+  QQMediaInfo,
+  MultimodalContent,
 } from './types.js';
 
 export interface QQAdapterOptions {
@@ -34,6 +37,7 @@ interface QueueItem {
   event: OneBotMessageEvent;
   ws?: WebSocket;
   timestamp: number;
+  mediaFiles?: QQMediaInfo[];
 }
 
 // Session message group
@@ -50,6 +54,7 @@ interface SessionMessages {
     content: string;
     timestamp: number;
     atList?: Array<{qq: string; name?: string}>; // List of @ mentions
+    mediaFiles?: QQMediaInfo[]; // Associated media files (images only)
   }>;
 }
 
@@ -72,19 +77,26 @@ export class QQAdapter extends EventEmitter {
 
   // Simple queue - just an array
   private messageQueue: QueueItem[] = [];
+  private readonly maxQueueSize: number;
   private isProcessing: boolean = false;
-
-  // Track if AI is in the middle of a conversation
-  private activeSessions: Set<string> = new Set();
-
-  // API rate limiting - removed for simplicity
-  private lastApiCallTime: number = 0;
 
   // File upload directory
   private readonly fileUploadDir: string;
+  private readonly fileExportDir: string;
+  private readonly maxFileBytes: number;
+  private readonly maxImageBytes: number;
+
+  // Media download directory
+  private readonly mediaDir: string;
 
   // Pending files waiting to be downloaded (file_id -> QQFileInfo)
   private pendingFiles: Map<string, QQFileInfo> = new Map();
+
+  // Image storage for multimodal support (fileName -> {url, expireAt})
+  // 5 minutes auto-cleanup
+  private imageStorage: Map<string, { url: string; fileId: string; expireAt: number }> = new Map();
+  private imageCleanupInterval?: NodeJS.Timeout;
+  private fileCleanupInterval?: NodeJS.Timeout;
 
   // Reconnection state
   private reconnectAttempts: number = 0;
@@ -96,10 +108,8 @@ export class QQAdapter extends EventEmitter {
 
   // QQ Context Compression
   private isCompressing: boolean = false;
-  private pendingQQMessagesDuringCompression: string[] = [];
   private qqSummaryMessage?: string; // Current QQ summary
   private readonly COMPRESSION_THRESHOLD = 0.5; // 50% token usage
-  private compressionLockKey = 'qq-compression';
 
   constructor(options: QQAdapterOptions) {
     super();
@@ -107,11 +117,62 @@ export class QQAdapter extends EventEmitter {
     this.configManager = options.configManager;
     this.workingDir = options.workingDir;
     this.fileUploadDir = path.join(this.workingDir, 'files', 'qq-uploads');
+    this.fileExportDir = path.resolve(this.workingDir, 'files');
+    this.mediaDir = path.join(this.workingDir, 'files', 'qq-media'); // Kept for compatibility but not used
+    this.maxFileBytes = parseInt(process.env.QQ_MAX_FILE_BYTES || String(50 * 1024 * 1024), 10);
+    this.maxImageBytes = parseInt(process.env.QQ_MAX_IMAGE_BYTES || String(10 * 1024 * 1024), 10);
+    this.maxQueueSize = parseInt(process.env.QQ_MAX_QUEUE_SIZE || '200', 10);
 
     const maxParallel = parseInt(process.env.QQ_MAX_PARALLEL_SESSIONS || '3', 10);
     this.sessionSemaphore = new Semaphore(Number.isFinite(maxParallel) ? maxParallel : 3);
 
     this.ensureFileUploadDir();
+
+  }
+
+  /**
+   * Start the image storage cleanup timer
+   * Removes expired entries every minute
+   */
+  private startImageCleanupTimer(): void {
+    this.imageCleanupInterval = setInterval(() => {
+      const now = Date.now();
+      let cleaned = 0;
+      for (const [fileName, data] of this.imageStorage.entries()) {
+        if (data.expireAt <= now) {
+          this.imageStorage.delete(fileName);
+          cleaned++;
+        }
+      }
+      if (cleaned > 0) {
+        console.log(`[QQ] Cleaned up ${cleaned} expired image(s) from storage`);
+      }
+    }, 60000); // Run every minute
+  }
+
+  /**
+   * Store image info for multimodal access
+   * Auto-expires after 5 minutes
+   */
+  private storeImageInfo(fileName: string, url: string, fileId: string): void {
+    const expireAt = Date.now() + 5 * 60 * 1000; // 5 minutes
+    this.imageStorage.set(fileName, { url, fileId, expireAt });
+    console.log(`[QQ] Stored image info: ${fileName} (expires at ${new Date(expireAt).toLocaleTimeString()})`);
+  }
+
+  /**
+   * Get stored image info by file name
+   */
+  private getStoredImageInfo(fileName: string): { url: string; fileId: string } | null {
+    const data = this.imageStorage.get(fileName);
+    if (!data) {
+      return null;
+    }
+    if (data.expireAt <= Date.now()) {
+      this.imageStorage.delete(fileName);
+      return null;
+    }
+    return { url: data.url, fileId: data.fileId };
   }
 
   /**
@@ -157,6 +218,7 @@ export class QQAdapter extends EventEmitter {
       }
 
       this.isRunning = true;
+      this.startImageCleanupTimer();
       console.log('[QQ] Adapter started successfully');
 
       // Start the processing loop
@@ -174,8 +236,6 @@ export class QQAdapter extends EventEmitter {
    * Stop the QQ adapter
    */
   async stop(): Promise<void> {
-    if (!this.isRunning) return;
-
     this.isRunning = false;
 
     this.stopHeartbeat();
@@ -193,6 +253,20 @@ export class QQAdapter extends EventEmitter {
       }
       this.wsClient = undefined;
     }
+
+    // Clear image cleanup timer
+    if (this.imageCleanupInterval) {
+      clearInterval(this.imageCleanupInterval);
+      this.imageCleanupInterval = undefined;
+    }
+
+    if (this.fileCleanupInterval) {
+      clearInterval(this.fileCleanupInterval);
+      this.fileCleanupInterval = undefined;
+    }
+
+    // Clear image storage
+    this.imageStorage.clear();
 
     console.log('[QQ] Adapter stopped');
   }
@@ -246,6 +320,19 @@ export class QQAdapter extends EventEmitter {
       this.wsServer = new WebSocket.Server({ port, host: config.host || '0.0.0.0' });
 
       this.wsServer.on('connection', (ws, req) => {
+        if (config.accessToken) {
+          const authHeader = req.headers?.authorization;
+          const bearerToken = typeof authHeader === 'string' && authHeader.startsWith('Bearer ')
+            ? authHeader.slice('Bearer '.length)
+            : undefined;
+          const queryToken = req.url ? new URL(req.url, 'ws://localhost').searchParams.get('token') || undefined : undefined;
+          if (bearerToken !== config.accessToken && queryToken !== config.accessToken) {
+            console.warn('[QQ] Rejected unauthenticated NapCat connection');
+            ws.close(1008, 'Unauthorized');
+            return;
+          }
+        }
+
         const clientIp = req.socket.remoteAddress || 'unknown';
         console.log(`[QQ] NapCat connected from ${clientIp}`);
         this.wsClient = ws;
@@ -463,6 +550,10 @@ export class QQAdapter extends EventEmitter {
   }
 
   private async handleMessageEvent(event: OneBotMessageEvent, ws: WebSocket): Promise<void> {
+    if (event.self_id) {
+      this.selfId = event.self_id;
+    }
+
     // Check permissions
     if (!this.checkPermissions(event)) {
       return;
@@ -486,6 +577,9 @@ export class QQAdapter extends EventEmitter {
       this.pendingFiles.set(fileInfo.fileId, fileInfo);
     }
 
+    // Detect images for multimodal support
+    const mediaList = this.detectMediaInfo(event);
+
     // Group chat load-shedding: if not @ me and not a direct question, don't enqueue
     if (event.message_type === 'group') {
       const atMe = this.isAtMe(event, text);
@@ -496,10 +590,23 @@ export class QQAdapter extends EventEmitter {
     }
 
     // Add to queue
+    if (this.messageQueue.length >= this.maxQueueSize) {
+      const dropped = this.messageQueue.shift();
+      console.warn(`[QQ] Message queue full, dropped oldest message from ${dropped?.event.user_id || 'unknown'}`);
+    }
     this.messageQueue.push({
       event,
       ws,
       timestamp: Date.now(),
+      mediaFiles: mediaList,
+    });
+    this.emit('activity', {
+      channel: 'qq',
+      session: event.message_type === 'group'
+        ? `group:${event.group_id}`
+        : `private:${event.user_id}`,
+      userId: event.user_id,
+      groupId: event.group_id,
     });
 
     console.log(`[QQ] Queued message from ${event.user_id}: ${text?.slice(0, 30) || '(empty)'}`);
@@ -541,7 +648,9 @@ export class QQAdapter extends EventEmitter {
   }
 
   /**
-   * Detect file/image messages in the event - just record info, don't download
+   * Detect file messages in the event - just record info, don't download
+   * Only handles real files (segment.type === 'file'), NOT images
+   * Images are handled by detectMediaInfo for multimodal support
    */
   private async detectFileMessage(event: OneBotMessageEvent): Promise<QQFileInfo | null> {
     if (typeof event.message === 'string') {
@@ -551,10 +660,10 @@ export class QQAdapter extends EventEmitter {
     for (const segment of event.message) {
       if (segment.type === 'file' && segment.data) {
         const fileId = segment.data.file_id;
-        
+
         // Debug: log all available fields
         console.log(`[QQ] File segment raw data keys:`, Object.keys(segment.data));
-        console.log(`[QQ] File segment full data:`, JSON.stringify(segment.data, null, 2));
+        console.log(`[QQ] File segment fields:`, Object.keys(segment.data));
 
         // Try multiple possible field names for filename according to OneBot 11 spec
         // NapCat/OneBot 可能使用不同的字段名
@@ -571,9 +680,9 @@ export class QQAdapter extends EventEmitter {
         const fileName = possibleFileNames[0] || 'unnamed_file';
         console.log(`[QQ] File name candidates:`, possibleFileNames);
         console.log(`[QQ] Selected file name: ${fileName}`);
-        
-        const fileSize = segment.data.file_size 
-          || segment.data.size 
+
+        const fileSize = segment.data.file_size
+          || segment.data.size
           || 0;
 
         console.log(`[QQ] File detected - ID: ${fileId}, Name: ${fileName}, Size: ${fileSize}`);
@@ -582,7 +691,7 @@ export class QQAdapter extends EventEmitter {
         const dateDir = new Date().toISOString().split('T')[0];
         const targetDir = path.join(this.fileUploadDir, dateDir);
         await fs.mkdir(targetDir, { recursive: true });
-        
+
         // Sanitize filename for filesystem
         const safeFileName = fileName !== 'unnamed_file' ? this.sanitizeFileName(fileName) : `unnamed_${Date.now()}`;
         const localPath = path.join(targetDir, safeFileName);
@@ -599,53 +708,8 @@ export class QQAdapter extends EventEmitter {
         };
 
         return fileInfo;
-      } else if (segment.type === 'image' && segment.data) {
-        // Debug: log all available fields
-        console.log(`[QQ] Image segment raw data keys:`, Object.keys(segment.data));
-        console.log(`[QQ] Image segment full data:`, JSON.stringify(segment.data, null, 2));
-
-        // For images, use url or file_id as ID
-        const fileId = segment.data.file_id || segment.data.url || segment.data.file;
-
-        // Try multiple possible field names for filename
-        const possibleFileNames = [
-          segment.data.file_name,
-          segment.data.name,
-          segment.data.file,
-          segment.data.filename,
-          'image.jpg',
-        ].filter(Boolean);
-
-        const fileName = possibleFileNames[0] || 'image.jpg';
-        console.log(`[QQ] Image name candidates:`, possibleFileNames);
-        console.log(`[QQ] Selected image name: ${fileName}`);
-        
-        const fileSize = segment.data.file_size 
-          || segment.data.size 
-          || 0;
-
-        console.log(`[QQ] Image detected - ID: ${fileId?.substring(0, 50)}, Name: ${fileName}, Size: ${fileSize}`);
-
-        const dateDir = new Date().toISOString().split('T')[0];
-        const targetDir = path.join(this.fileUploadDir, dateDir);
-        await fs.mkdir(targetDir, { recursive: true });
-        
-        const safeFileName = this.sanitizeFileName(fileName);
-        const localPath = path.join(targetDir, safeFileName);
-
-        const fileInfo: QQFileInfo = {
-          fileId: fileId || `img_${Date.now()}`,
-          fileName: safeFileName,
-          fileSize,
-          localPath,
-          receivedAt: Date.now(),
-          senderId: event.user_id,
-          groupId: event.group_id,
-          mimeType: 'image/jpeg',
-        };
-
-        return fileInfo;
       }
+      // Note: Images (segment.type === 'image') are handled by detectMediaInfo, not here
     }
 
     return null;
@@ -696,7 +760,7 @@ export class QQAdapter extends EventEmitter {
         return null;
       }
 
-      console.log(`[QQ] Got file URL: ${fileUrl.substring(0, 100)}...`);
+      console.log(`[QQ] Got file URL from NapCat`);
 
       // Step 2: Download file content using NapCat download_file API or direct HTTP
       let downloadSuccess = false;
@@ -734,7 +798,12 @@ export class QQAdapter extends EventEmitter {
           throw new Error(`HTTP ${response.status}: ${response.statusText}`);
         }
 
+        this.assertResponseSizeAllowed(response, this.maxFileBytes, 'file');
+
         const buffer = await response.arrayBuffer();
+        if (buffer.byteLength > this.maxFileBytes) {
+          throw new Error(`File too large: ${buffer.byteLength} bytes exceeds ${this.maxFileBytes}`);
+        }
         await fs.writeFile(fileInfo.localPath, Buffer.from(buffer));
         console.log(`[QQ] File downloaded via HTTP: ${fileInfo.localPath} (${buffer.byteLength} bytes)`);
       }
@@ -754,12 +823,13 @@ export class QQAdapter extends EventEmitter {
    */
   private requestFileUrl(fileId: string, params: any): Promise<string | null> {
     return new Promise((resolve) => {
+      const requestId = `file_url_${Date.now()}_${Math.random().toString(36).slice(2)}`;
       const messageHandler = (data: any) => {
         try {
           const response = JSON.parse(data.toString());
-          console.log(`[QQ] File URL response:`, JSON.stringify(response).substring(0, 200));
+          console.log(`[QQ] File URL response status: ${response.status || 'unknown'}`);
 
-          if (response.status === 'ok' && response.data) {
+          if (response.echo === requestId && response.status === 'ok' && response.data) {
             // NapCat returns URL in data.url
             const url = response.data.url;
             if (url) {
@@ -773,6 +843,7 @@ export class QQAdapter extends EventEmitter {
         }
       };
 
+      params.echo = requestId;
       this.wsClient?.on('message', messageHandler);
       this.wsClient?.send(JSON.stringify(params));
 
@@ -788,12 +859,13 @@ export class QQAdapter extends EventEmitter {
    */
   private requestDownloadFile(params: any): Promise<string | null> {
     return new Promise((resolve) => {
+      const requestId = `download_${Date.now()}_${Math.random().toString(36).slice(2)}`;
       const messageHandler = (data: any) => {
         try {
           const response = JSON.parse(data.toString());
           console.log(`[QQ] Download file response:`, JSON.stringify(response).substring(0, 200));
 
-          if (response.status === 'ok' && response.data && response.data.file) {
+          if (response.echo === requestId && response.status === 'ok' && response.data && response.data.file) {
             this.wsClient?.removeListener('message', messageHandler);
             resolve(response.data.file);
             return;
@@ -803,6 +875,7 @@ export class QQAdapter extends EventEmitter {
         }
       };
 
+      params.echo = requestId;
       this.wsClient?.on('message', messageHandler);
       this.wsClient?.send(JSON.stringify(params));
 
@@ -856,6 +929,218 @@ export class QQAdapter extends EventEmitter {
       '.rar': 'application/x-rar-compressed',
     };
     return mimeTypes[ext] || 'application/octet-stream';
+  }
+
+  /**
+   * Sanitize fileId for use as filename in media storage
+   * Handles URLs by extracting a safe identifier
+   */
+  private sanitizeFileNameForMedia(fileId: string): string {
+    // If it's a URL, extract just the filename part or use a hash
+    if (fileId.startsWith('http://') || fileId.startsWith('https://')) {
+      try {
+        const url = new URL(fileId);
+        // Get the last part of the path, or use a short hash of the URL
+        const pathParts = url.pathname.split('/');
+        const lastPart = pathParts[pathParts.length - 1];
+        if (lastPart && lastPart.length > 5) {
+          // Use last 20 chars of the filename part, sanitized
+          return lastPart.slice(-20).replace(/[^a-zA-Z0-9]/g, '_');
+        }
+        // Fallback: use hash of hostname + path
+        return url.hostname.replace(/[^a-zA-Z0-9]/g, '_') + '_' + Date.now().toString(36);
+      } catch {
+        // If URL parsing fails, just use timestamp
+        return 'media_' + Date.now().toString(36);
+      }
+    }
+    
+    // For regular fileIds, just take first 20 chars and sanitize
+    return fileId.substring(0, 20).replace(/[^a-zA-Z0-9]/g, '_');
+  }
+
+  /**
+   * Detect image MIME type from URL extension or file header
+   */
+  private detectImageMimeType(url: string, buffer?: Buffer): string {
+    // Try to get from URL extension first
+    const ext = path.extname(url).toLowerCase();
+    const mimeTypes: Record<string, string> = {
+      '.jpg': 'image/jpeg',
+      '.jpeg': 'image/jpeg',
+      '.png': 'image/png',
+      '.gif': 'image/gif',
+      '.webp': 'image/webp',
+      '.bmp': 'image/bmp',
+    };
+    if (mimeTypes[ext]) return mimeTypes[ext];
+    
+    // Try to detect from file header (magic numbers)
+    if (buffer) {
+      if (buffer[0] === 0xFF && buffer[1] === 0xD8) return 'image/jpeg';
+      if (buffer[0] === 0x89 && buffer[1] === 0x50) return 'image/png';
+      if (buffer[0] === 0x47 && buffer[1] === 0x49) return 'image/gif';
+      if (buffer[0] === 0x52 && buffer[1] === 0x49) return 'image/webp';
+    }
+    
+    return 'image/jpeg'; // Default fallback
+  }
+
+  // ==================== Media Detection & Download ====================
+
+  /**
+   * Detect images in message - only stores info, does NOT download
+   * AI must call get_image tool to actually view
+   * Images are stored in imageStorage with 5-minute auto-expiry
+   */
+  private detectMediaInfo(event: OneBotMessageEvent): QQMediaInfo[] {
+    const mediaList: QQMediaInfo[] = [];
+
+    if (typeof event.message === 'string') {
+      return mediaList;
+    }
+
+    for (const segment of event.message) {
+      if (segment.type === 'image' && segment.data) {
+        // Use file name as identifier (short and readable)
+        const fileId = segment.data.file || segment.data.file_id || `img_${Date.now()}`;
+        const fileName = segment.data.file_name || segment.data.name || segment.data.file || 'image.jpg';
+        const url = segment.data.url;
+        const fileSize = segment.data.file_size || segment.data.size || 0;
+
+        // Store in image storage for 5-minute access (keyed by fileName for AI lookup)
+        if (url) {
+          this.storeImageInfo(fileName, url, fileId);
+        }
+
+        mediaList.push({
+          type: 'image',
+          fileId: fileName,  // Use fileName as the ID shown to AI
+          fileName,
+          fileSize,
+          mimeType: 'image/jpeg',
+          downloaded: false,
+          url: url,
+          senderId: event.user_id,
+          groupId: event.group_id,
+          receivedAt: Date.now(),
+        });
+
+        console.log(`[QQ] Image detected: fileName="${fileName}" (AI can use get_image action to view)`);
+      }
+    }
+
+    return mediaList;
+  }
+
+  /**
+   * Get image for AI - download and return as base64 for maximum compatibility
+   * Some models don't support direct URLs, so we download and convert to base64
+   */
+  async getImageForAI(fileName: string, groupId?: number, userId?: number): Promise<MultimodalContent[] | null> {
+    console.log(`[QQ] AI requesting image: fileName="${fileName}"`);
+
+    try {
+      // Look up image info from storage by file name
+      const imageInfo = this.getStoredImageInfo(fileName);
+
+      if (!imageInfo) {
+        console.error(`[QQ] Image not found or expired: ${fileName}`);
+        return null;
+      }
+
+      console.log(`[QQ] Found image URL: ${imageInfo.url.substring(0, 60)}...`);
+
+      // Download the image and convert to base64 for maximum compatibility
+      console.log('[QQ] Downloading image for base64 conversion...');
+      const response = await fetch(imageInfo.url);
+      if (!response.ok) {
+        console.error(`[QQ] Failed to download image: ${response.status}`);
+        return null;
+      }
+
+      this.assertResponseSizeAllowed(response, this.maxImageBytes, 'image');
+
+      const buffer = Buffer.from(await response.arrayBuffer());
+      if (buffer.length > this.maxImageBytes) {
+        throw new Error(`Image too large: ${buffer.length} bytes exceeds ${this.maxImageBytes}`);
+      }
+      const base64 = buffer.toString('base64');
+
+      // Determine mime type from file extension
+      const ext = fileName.split('.').pop()?.toLowerCase() || 'jpg';
+      const mimeType = ext === 'png' ? 'image/png' : ext === 'gif' ? 'image/gif' : 'image/jpeg';
+
+      console.log(`[QQ] Image converted to base64: ${base64.length} chars (${(buffer.length / 1024).toFixed(1)}KB)`);
+
+      // Return OpenAI multimodal format with base64 data URL
+      // This works with all models that support vision
+      return [
+        { type: 'text', text: 'Image from QQ:' },
+        { type: 'image_url', image_url: { url: `data:${mimeType};base64,${base64}`, detail: 'high' } }
+      ];
+    } catch (error) {
+      console.error('[QQ] Failed to get image for AI:', error);
+      return null;
+    }
+  }
+
+  /**
+   * Get image URL from NapCat API (fallback when not in storage)
+   */
+  private async getMediaUrl(fileId: string, type: 'image', groupId?: number, userId?: number): Promise<string | null> {
+    if (!this.wsClient || this.wsClient.readyState !== WebSocket.OPEN) {
+      console.error('[QQ] WebSocket not connected');
+      return null;
+    }
+
+    return new Promise((resolve) => {
+      const requestId = `media_req_${Date.now()}`;
+
+      // Set up one-time listener for response
+      const messageHandler = (data: WebSocket.Data) => {
+        try {
+          const response = JSON.parse(data.toString());
+          if (response.echo === requestId && response.status === 'ok') {
+            this.wsClient?.removeListener('message', messageHandler);
+            const url = response.data?.url || response.data?.file;
+            resolve(url || null);
+          }
+        } catch {
+          // Ignore non-JSON messages
+        }
+      };
+
+      const ws = this.wsClient;
+      if (!ws) {
+        resolve(null);
+        return;
+      }
+      ws.on('message', messageHandler);
+
+      // Build request params
+      const params: any = { file_id: fileId };
+
+      // For images in groups, may need group_id
+      if (groupId) params.group_id = groupId;
+
+      const request = {
+        action: 'get_image',
+        params,
+        echo: requestId,
+      };
+      
+      const isUrl = fileId.startsWith('http://') || fileId.startsWith('https://');
+      console.log(`[QQ] Requesting ${type} with ${isUrl ? 'URL' : 'file_id'}: ${fileId.substring(0, 50)}...`);
+
+      ws.send(JSON.stringify(request));
+
+      // Timeout after 10 seconds
+      setTimeout(() => {
+        this.wsClient?.removeListener('message', messageHandler);
+        resolve(null);
+      }, 10000);
+    });
   }
 
   // ==================== Simple Processing Loop ====================
@@ -919,7 +1204,7 @@ export class QQAdapter extends EventEmitter {
 
       // Process each session
       if (cfg.parallelProcessing) {
-        console.log(`[QQ] Parallel session processing enabled (max=${process.env.QQ_MAX_PARALLEL_SESSIONS || '3'})`);
+        console.log(`[QQ] Parallel session preprocessing enabled (max=${process.env.QQ_MAX_PARALLEL_SESSIONS || '3'}); engine turns remain serialized`);
         await Promise.all(sessionGroups.map((session) =>
           this.sessionSemaphore.withPermit(async () => {
             console.log(`[QQ] Processing session ${session.sessionId} with ${session.messages.length} message(s)`);
@@ -964,6 +1249,7 @@ export class QQAdapter extends EventEmitter {
       const sessionId = this.getSessionId(event);
       const text = this.extractTextMessage(event.message) || '';
       const atList = this.extractAtList(event.message);
+      const mediaList = item.mediaFiles || [];
 
       if (!groups.has(sessionId)) {
         groups.set(sessionId, {
@@ -983,6 +1269,7 @@ export class QQAdapter extends EventEmitter {
         content: text,
         timestamp: event.time * 1000,
         atList,
+        mediaFiles: mediaList.length > 0 ? mediaList : undefined,
       });
     }
 
@@ -1010,20 +1297,18 @@ export class QQAdapter extends EventEmitter {
   }
 
   private async processSession(session: SessionMessages): Promise<void> {
-    // Step 1: Check and compress QQ context if needed
-    // This extracts QQ messages, generates summary, and updates context
-    await this.checkAndCompressQQContext();
+    const qqSession = this.getOrCreateSession(session);
+    qqSession.lastMessageTime = Date.now();
+    qqSession.messageCount += session.messages.length;
 
-    // Step 2: Build context
+    // Step 1: Build context
     const context = await this.buildSessionContext(session);
 
-    // Step 3: Build prompt with messages
+    // Step 2: Build prompt with messages
     const conversationHistory = this.buildPrompt(session, context);
 
-    // Step 4: Use the main engine with shared context
-    // All sessions share the same messages array for cross-session memory
-    console.log('[QQ] Sending to AI with SHARED context...');
-    const response = await this.engine.processUserInput(conversationHistory);
+    console.log('[QQ] Sending to AI with shared global context...');
+    const response = await this.engine.processUserInput(`[QQ Source session=${session.sessionId}]\n${conversationHistory}`);
 
     // Check response status
     if (response.includes('Rate limit exceeded')) {
@@ -1084,6 +1369,15 @@ export class QQAdapter extends EventEmitter {
 
       // Format: [Time] SenderName (ID: senderId): Content [@mentions] [YOU ARE MENTIONED]
       prompt += `[${new Date(msg.timestamp).toLocaleTimeString()}] ${msg.senderName} (ID: ${msg.senderId}): ${msg.content}${atDetails}${atMarker}\n`;
+
+      // Add image hints if message has associated images
+      if (msg.mediaFiles && msg.mediaFiles.length > 0) {
+        for (const media of msg.mediaFiles) {
+          if (media.type === 'image') {
+            prompt += `  [图片可用: file_id="${media.fileId}" (使用 qq tool 的 get_image action 查看)]\n`;
+          }
+        }
+      }
     }
 
     prompt += `\n${this.getInstructionPrompt(session.type, context)}`;
@@ -1112,14 +1406,15 @@ You are processing QQ messages. Use the qq tool to send replies and files.
 - Messages not involving you
 - Just say "NO" to skip
 
-### File Operations
+### File Operations (For Real Files Only - NOT Images)
 
-**RECEIVING FILES:**
-- When users send you files/images, they are DETECTED but NOT automatically downloaded
+**RECEIVING REAL FILES (documents, pdfs, zips, etc.):**
+- When users send you FILES (not images), they are DETECTED but NOT automatically downloaded
 - Use 'list_pending_files' action to see what files are waiting
 - Use 'receive_file' action with the file_id to download
 - Files are saved to: files/qq-uploads/YYYY-MM-DD/
 - After receiving, you can read the file using file tools
+- NOTE: This is for REAL FILES only (like .pdf, .doc, .zip) - NOT for images
 
 **SENDING FILES:**
 - Use action: "send_file"
@@ -1128,7 +1423,7 @@ You are processing QQ messages. Use the qq tool to send replies and files.
 - Optional: file_name (custom display name)
 - Example: {"action":"send_file","group_id":123,"file_path":"files/output/chart.png","end":true}
 
-**FILE WORKFLOW:**
+**FILE WORKFLOW (for real files only):**
 1. User sends file → You see message with [File detected]
 2. Call {"action":"list_pending_files","end":false} to see pending files
 3. Call {"action":"receive_file","file_id":"xxx","end":false} to download
@@ -1146,6 +1441,38 @@ You are processing QQ messages. Use the qq tool to send replies and files.
 - Use qq tool with action "send_file"
 - Provide the absolute file path
 - System will handle file upload
+
+### IMAGE SUPPORT (IMPORTANT: DIFFERENT FROM FILES!)
+When users send IMAGES (.jpg, .png, .gif, etc.), they are detected but NOT automatically viewed by you.
+
+**⚠️ IMPORTANT DISTINCTION:**
+- IMAGES (photos, screenshots, memes) → Use "get_image" action (multimodal, you "see" it)
+- FILES (pdf, doc, zip, etc.) → Use "receive_file" action (download to read)
+- If you see [图片可用] → It's an IMAGE, use get_image
+- If you see [File detected] → It's a FILE, use receive_file
+
+**VIEWING IMAGES (MULTIMODAL):**
+- When you see "[图片可用: file_id=xxx.jpg]" in messages
+- Use qq tool action "get_image" with the file_id to view it
+- The image will be sent to you in multimodal format (you'll "see" it directly)
+- Example: {"action":"get_image","file_id":"xxx.jpg","group_id":123}
+
+**WHEN TO USE get_image:**
+- User asks "这是什么图片" or "看看这张图"
+- User sends a photo/screenshot and you need to understand it
+- CRITICAL: After calling get_image, the image will be INSTANTLY transmitted to you via multimodal API - you will "see" it directly!
+- DO NOT write code to download images - the get_image tool handles everything!
+- DO NOT use receive_file for images - that's for documents only!
+- DO NOT use code-runner to download images - it's unnecessary and wasteful!
+
+**HOW get_image WORKS:**
+1. You call {"action":"get_image","file_id":"xxx.jpg"}
+2. The system automatically transmits the image to your multimodal context
+3. You INSTANTLY "see" the image (like a user showing you a photo)
+4. You directly describe/analyze the image content
+5. NO code needed, NO download needed, NO file reading needed!
+
+**WARNING:** Using code tools to download images is WRONG and WASTEFUL. Use get_image!
 
 ### Conversation Control
 - After sending a message/file, decide if you need to continue
@@ -1255,12 +1582,13 @@ Now process these messages and respond appropriately.`;
    */
   private requestGroupInfo(groupId: number): Promise<string | null> {
     return new Promise((resolve) => {
+      const requestId = `group_info_${Date.now()}_${Math.random().toString(36).slice(2)}`;
       const messageHandler = (data: any) => {
         try {
           const response = JSON.parse(data.toString());
           console.log(`[QQ] Group info response:`, JSON.stringify(response).substring(0, 200));
 
-          if (response.status === 'ok' && response.data) {
+          if (response.echo === requestId && response.status === 'ok' && response.data) {
             // NapCat returns group_name in data.group_name
             const groupName = response.data.group_name;
             if (groupName) {
@@ -1279,6 +1607,7 @@ Now process these messages and respond appropriately.`;
         params: {
           group_id: String(groupId),
         },
+        echo: requestId,
       };
 
       this.wsClient?.on('message', messageHandler);
@@ -1293,7 +1622,7 @@ Now process these messages and respond appropriately.`;
 
   private checkPermissions(event: OneBotMessageEvent): boolean {
     // Check blocked first
-    if (this.configManager.isUserAllowed(event.user_id) === false) {
+    if (this.configManager.isUserBlocked(event.user_id)) {
       return false;
     }
 
@@ -1355,21 +1684,27 @@ Now process these messages and respond appropriately.`;
           console.log(`[QQ] Converted relative path to absolute: ${absoluteFilePath}`);
         }
 
+        const resolvedFilePath = path.resolve(absoluteFilePath);
+        const exportRoot = this.fileExportDir + path.sep;
+        if (resolvedFilePath !== this.fileExportDir && !resolvedFilePath.startsWith(exportRoot)) {
+          return `[Error: File path is outside allowed export directory: ${this.fileExportDir}]`;
+        }
+
         // Check if file exists
         try {
-          await fs.access(absoluteFilePath);
+          await fs.access(resolvedFilePath);
         } catch {
-          return `[Error: File not found: ${params.file_path} (resolved: ${absoluteFilePath})]`;
+          return `[Error: File not found: ${params.file_path} (resolved: ${resolvedFilePath})]`;
         }
 
         // Get file name
-        const fileName = params.file_name || path.basename(absoluteFilePath);
+        const fileName = params.file_name || path.basename(resolvedFilePath);
 
         // OneBot file upload API - 根据 NapCat API 文档
         const apiParams: any = {
           action: params.user_id ? 'upload_private_file' : 'upload_group_file',
           params: {
-            file: absoluteFilePath,
+            file: resolvedFilePath,
             name: fileName,
             upload_file: true,  // 必需参数，根据 API 文档
           },
@@ -1383,7 +1718,7 @@ Now process these messages and respond appropriately.`;
 
         const payload = JSON.stringify(apiParams);
         console.log(`[QQ] Uploading file: ${fileName} to ${params.user_id ? 'user' : 'group'} ${params.user_id || params.group_id}`);
-        console.log(`[QQ] API params:`, JSON.stringify(apiParams));
+        console.log(`[QQ] API params prepared for ${params.user_id ? 'private' : 'group'} upload`);
 
         this.wsClient.send(payload);
         console.log(`[QQ] File upload request sent`);
@@ -1406,10 +1741,14 @@ Now process these messages and respond appropriately.`;
         apiParams.params.group_id = params.group_id;
       }
 
-      const payload = JSON.stringify(apiParams);
-      console.log(`[QQ] Sending ${params.action}`);
+      const config = this.configManager.getConfig();
+      const messageChunks = this.splitMessageIfNeeded(messageContent, config.maxMessageLength, config.splitLongMessages);
+      console.log(`[QQ] Sending ${params.action}${messageChunks.length > 1 ? ` in ${messageChunks.length} chunks` : ''}`);
 
-      this.wsClient.send(payload);
+      for (const chunk of messageChunks) {
+        apiParams.params.message = chunk;
+        this.wsClient.send(JSON.stringify(apiParams));
+      }
       console.log(`[QQ] Message sent successfully`);
       return '[Message sent successfully]';
     } catch (error) {
@@ -1419,11 +1758,74 @@ Now process these messages and respond appropriately.`;
     }
   }
 
+  private splitMessageIfNeeded(message: string, maxLength: number, enabled: boolean): string[] {
+    const safeMax = Number.isFinite(maxLength) && maxLength > 0 ? maxLength : 2000;
+    if (!enabled || message.length <= safeMax) return [message];
+
+    const chunks: string[] = [];
+    for (let i = 0; i < message.length; i += safeMax) {
+      chunks.push(message.slice(i, i + safeMax));
+    }
+    return chunks;
+  }
+
   // ==================== File Cleanup (Stub) ====================
 
   scheduleFileCleanup(_hours: number): void {
-    // Stub method for compatibility - file cleanup not implemented in simplified version
-    console.log('[QQ] File cleanup scheduled (stub)');
+    const intervalMs = Math.max(_hours, 1) * 60 * 60 * 1000;
+    if (this.fileCleanupInterval) {
+      clearInterval(this.fileCleanupInterval);
+    }
+    this.fileCleanupInterval = setInterval(() => {
+      void this.cleanupOldFiles(7 * 24 * 60 * 60 * 1000).catch(error => {
+        console.error('[QQ] File cleanup failed:', error);
+      });
+    }, intervalMs);
+    console.log('[QQ] File cleanup scheduled');
+  }
+
+  private async cleanupOldFiles(maxAgeMs: number): Promise<void> {
+    const roots = [this.fileUploadDir, this.mediaDir];
+    const cutoff = Date.now() - maxAgeMs;
+    for (const root of roots) {
+      await this.cleanupDirectory(root, cutoff);
+    }
+  }
+
+  private async cleanupDirectory(dir: string, cutoff: number): Promise<void> {
+    let entries: Array<{ name: string; isDirectory(): boolean; isFile(): boolean }>;
+    try {
+      entries = await fs.readdir(dir, { withFileTypes: true }) as any;
+    } catch {
+      return;
+    }
+
+    for (const entry of entries) {
+      const fullPath = path.join(dir, entry.name);
+      if (entry.isDirectory()) {
+        await this.cleanupDirectory(fullPath, cutoff);
+        continue;
+      }
+      if (!entry.isFile()) continue;
+
+      try {
+        const stat = await fs.stat(fullPath);
+        if (stat.mtimeMs < cutoff) {
+          await fs.unlink(fullPath);
+        }
+      } catch {
+        // Ignore cleanup races.
+      }
+    }
+  }
+
+  private assertResponseSizeAllowed(response: Response, maxBytes: number, label: string): void {
+    const contentLength = response.headers.get('content-length');
+    if (!contentLength) return;
+    const size = Number(contentLength);
+    if (Number.isFinite(size) && size > maxBytes) {
+      throw new Error(`${label} too large: ${size} bytes exceeds ${maxBytes}`);
+    }
   }
 
   // ==================== QQ Context Compression ====================
@@ -1437,22 +1839,53 @@ Now process these messages and respond appropriately.`;
       return; // Already compressing, skip
     }
 
-    const messages = this.engine.getMessages();
-    const tokenUsage = await this.calculateTokenUsage(messages);
+    this.isCompressing = true;
 
-    if (tokenUsage >= this.COMPRESSION_THRESHOLD) {
-      console.log(`[QQ] Context compression triggered (${Math.round(tokenUsage * 100)}% tokens)`);
-      await this.compressQQContext();
+    try {
+      const messages = this.engine.getMessagesSnapshot();
+      const tokenUsage = await this.calculateTokenUsage(messages);
+
+      if (tokenUsage >= this.COMPRESSION_THRESHOLD) {
+        console.log(`[QQ] Context compression triggered (${Math.round(tokenUsage * 100)}% tokens)`);
+        await this.compressQQContext();
+      }
+    } finally {
+      this.isCompressing = false;
     }
   }
 
   /**
    * Calculate token usage ratio
+   * Improved estimation for mixed Chinese/English content
    */
   private async calculateTokenUsage(messages: ChatMessage[]): Promise<number> {
-    // Simple estimation: ~4 characters per token
-    const totalChars = messages.reduce((sum, msg) => sum + (msg.content?.length || 0), 0);
-    const estimatedTokens = totalChars / 4;
+    let estimatedTokens = 0;
+
+    for (const msg of messages) {
+      const content = msg.content || '';
+      if (typeof content === 'string') {
+        // Count Chinese characters (each ~1 token)
+        const chineseChars = (content.match(/[\u4e00-\u9fa5]/g) || []).length;
+        // Count non-Chinese characters (4 chars ~1 token)
+        const otherChars = content.length - chineseChars;
+        estimatedTokens += chineseChars + (otherChars / 4);
+      } else if (Array.isArray(content)) {
+        // Handle multimodal content
+        for (const item of content) {
+          if (item.type === 'text' && item.text) {
+            const chineseChars = (item.text.match(/[\u4e00-\u9fa5]/g) || []).length;
+            const otherChars = item.text.length - chineseChars;
+            estimatedTokens += chineseChars + (otherChars / 4);
+          }
+          // Image/audio tokens are handled separately by the model
+        }
+      }
+    }
+
+    // Add fixed overhead for system prompts and tools (~1500 tokens)
+    const fixedOverhead = 1500;
+    estimatedTokens += fixedOverhead;
+
     const maxTokens = 8000; // Match TOKEN_CONFIG.maxHistoryTokens
     return estimatedTokens / maxTokens;
   }
@@ -1466,7 +1899,6 @@ Now process these messages and respond appropriately.`;
    * 5. Adding buffered messages
    */
   private async compressQQContext(): Promise<void> {
-    this.isCompressing = true;
     console.log('[QQ] Starting context compression...');
 
     try {
@@ -1495,24 +1927,14 @@ Now process these messages and respond appropriately.`;
 
       // Step 4: Update engine context
       console.log('[QQ] Step 4: Updating engine context...');
-      this.engine.setMessages(messagesWithSummary);
+      await this.engine.replaceMessagesLocked(messagesWithSummary);
       this.qqSummaryMessage = newSummary;
 
       console.log(`[QQ] Context compressed successfully!`);
       console.log(`[QQ] New context has ${messagesWithSummary.length} messages`);
 
-      // Step 5: Add buffered messages that arrived during compression
-      if (this.pendingQQMessagesDuringCompression.length > 0) {
-        console.log(`[QQ] Adding ${this.pendingQQMessagesDuringCompression.length} buffered messages`);
-        for (const msg of this.pendingQQMessagesDuringCompression) {
-          this.engine.getMessages().push({ role: 'user', content: msg });
-        }
-        this.pendingQQMessagesDuringCompression = [];
-      }
     } catch (error) {
       console.error('[QQ] Context compression failed:', error);
-    } finally {
-      this.isCompressing = false;
     }
   }
 
@@ -1527,13 +1949,13 @@ Now process these messages and respond appropriately.`;
     remainingMessages: ChatMessage[];
     oldSummary: string | null;
   } {
-    const messages = this.engine.getMessages();
+    const messages = this.engine.getMessagesSnapshot();
     const extracted: ChatMessage[] = []; // These will be compressed into summary
     const remaining: ChatMessage[] = []; // These will be kept (system prompts only)
     let oldSummary: string | null = null; // Existing summary to be merged
 
     for (const msg of messages) {
-      const content = msg.content || '';
+      const content = contentToText(msg.content);
       
       // Check if this is an existing summary
       if (this.isExistingSummary(msg)) {
@@ -1558,14 +1980,14 @@ Now process these messages and respond appropriately.`;
    * Note: Old summaries will be extracted and given to AI for merging
    */
   private shouldKeepMessage(msg: ChatMessage): boolean {
-    const content = msg.content || '';
-    
+    const content = contentToText(msg.content);
+
     // Remove OLD QQ CONTEXT SUMMARY (it will be extracted separately and merged by AI)
     // We only want to keep the NEW summary after compression
     if (content.startsWith('[QQ CONTEXT SUMMARY]') || content.startsWith('[QQ SUMMARY]')) {
       return false; // Remove old summary, AI will create a merged one
     }
-    
+
     // Keep system prompts that are NOT QQ-related messages
     // System prompts are role='system' AND don't start with QQ patterns
     if (msg.role === 'system') {
@@ -1575,7 +1997,16 @@ Now process these messages and respond appropriately.`;
       }
       return true; // Real system prompt, keep it
     }
-    
+
+    // CRITICAL: Keep multimodal messages (images) - they should not be compressed
+    if (Array.isArray(msg.content)) {
+      const hasImage = msg.content.some((item: any) => item.type === 'image_url' && item.image_url?.url);
+      if (hasImage) {
+        console.log('[QQ] Keeping multimodal image message during compression');
+        return true; // Keep multimodal image messages
+      }
+    }
+
     // Everything else (user messages, assistant responses, tool results) should be removed
     return false;
   }
@@ -1584,7 +2015,7 @@ Now process these messages and respond appropriately.`;
    * Check if a message is an existing summary
    */
   private isExistingSummary(msg: ChatMessage): boolean {
-    const content = msg.content || '';
+    const content = contentToText(msg.content);
     return content.startsWith('[QQ CONTEXT SUMMARY]') || content.startsWith('[QQ SUMMARY]');
   }
 
@@ -1602,7 +2033,7 @@ Now process these messages and respond appropriately.`;
     
     // Build the conversation text for AI
     const conversationText = messages.map((msg, idx) => {
-      const content = msg.content || '';
+      const content = contentToText(msg.content);
       // Truncate very long messages
       if (content.length > 1000) {
         return `[${idx}] ${content.slice(0, 1000)}... (truncated)`;
@@ -1690,8 +2121,20 @@ Be concise but ensure important details are preserved.`;
 
     // Fallback: create simple summary
     console.log('[QQ] Using fallback simple summary');
-    const userCount = new Set(messages.filter(m => m.role === 'user').map(m => m.content?.split(':')[0])).size;
+    const userCount = new Set(messages.filter(m => m.role === 'user').map(m => contentToText(m.content).split(':')[0])).size;
     return `[QQ SUMMARY] Conversation with ${userCount} users, ${messages.length} messages total. [Details omitted due to compression error]`;
+  }
+
+  getStatus(): { running: boolean; paused: boolean; connected: boolean; queueLength: number; sessions: number; pendingFiles: number; imageCacheSize: number } {
+    return {
+      running: this.isRunning,
+      paused: this.isPaused,
+      connected: this.wsClient?.readyState === WebSocket.OPEN,
+      queueLength: this.messageQueue.length,
+      sessions: this.sessions.size,
+      pendingFiles: this.pendingFiles.size,
+      imageCacheSize: this.imageStorage.size,
+    };
   }
 
   /**
@@ -1723,20 +2166,4 @@ Be concise but ensure important details are preserved.`;
     return result;
   }
 
-  /**
-   * Add a QQ message to context, handling compression state
-   */
-  private async addQQMessageToContext(message: string): Promise<void> {
-    // Check if we need compression first
-    await this.checkAndCompressQQContext();
-
-    if (this.isCompressing) {
-      // Buffer the message during compression
-      this.pendingQQMessagesDuringCompression.push(message);
-      console.log('[QQ] Message buffered during compression');
-    } else {
-      // Add directly to context
-      this.engine.getMessages().push({ role: 'user', content: message });
-    }
-  }
 }

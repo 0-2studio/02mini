@@ -57,8 +57,6 @@ export class ContextManager {
     this.aiClient = options.aiClient;
   }
   
-  // Queue for pending compaction requests
-  private compactionQueue: (() => void)[] = [];
   private isProcessingCompaction = false;
 
   /**
@@ -115,7 +113,9 @@ export class ContextManager {
 
       try {
         // Perform compaction (pass AI client for intelligent summarization)
-        const result = await incrementalCompaction(messages, this.maxTokens, this.aiClient);
+        const result = options.forceLevel
+          ? await compactContext(messages, level, undefined, this.aiClient)
+          : await incrementalCompaction(messages, this.maxTokens, this.aiClient);
 
         // If compaction didn't help much, return original
         if (result.compressedTokens >= result.originalTokens * 0.95) {
@@ -155,15 +155,14 @@ export class ContextManager {
 
         return {
           messages: result.removedIndices.length > 0
-            ? this.rebuildMessages(messages, result)
+            ? (result.messages || this.rebuildMessages(messages, result))
             : messages,
           compacted: true,
           report,
         };
       } finally {
         // Reset internal flags
-        this.isCompacting = false;
-        this.isProcessingCompaction = false;
+        this.endCompaction();
         console.log('[Context] Global compaction lock released');
       }
     });
@@ -241,7 +240,7 @@ export class ContextManager {
     
     const percentage = status.percentage.toFixed(1);
     const statusEmoji = status.status === 'critical' ? '🔴' : 
-                       status.status === 'warning' ? '🟡' : '🟢';
+                       (status.status === 'medium' || status.status === 'light') ? '🟡' : '🟢';
     
     return `${statusEmoji} Context: ${stats.totalMessages} msgs, ${formatTokenCount(status.used)}/${formatTokenCount(status.max)} tokens (${percentage}%)`;
   }
@@ -313,14 +312,6 @@ export class ContextManager {
     return new Promise((resolve) => {
       this.compactionResolvers.push(resolve);
     });
-  }
-
-  /**
-   * Start compaction - blocks other operations
-   */
-  private startCompaction(): void {
-    this.isCompacting = true;
-    console.log('[Context] Compaction started - blocking other operations');
   }
 
   /**

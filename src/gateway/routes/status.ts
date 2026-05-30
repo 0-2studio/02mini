@@ -11,6 +11,7 @@ export function createStatusRoutes(context: GatewayContext) {
     // GET /api/status
     app.get('/status', async () => {
       const stats = context.engine.getContextStats();
+      const runtime = context.engine.getRuntimeStatus();
       const jobs = context.cronScheduler.getJobs();
       const nextJob = jobs
         .filter((j) => j.enabled && j.state.nextRunAtMs)
@@ -31,12 +32,14 @@ export function createStatusRoutes(context: GatewayContext) {
           status: context.engine.getContextStatus(),
           compressionCount: stats.compressionCount,
         },
+        engine: runtime,
         cron: {
           enabled: true,
           jobCount: jobs.length,
           enabledJobs: jobs.filter((j) => j.enabled).length,
           nextJobAt: nextJob?.state.nextRunAtMs,
           nextJobName: nextJob?.name,
+          executingJobs: context.cronScheduler.getExecutingJobs(),
         },
       };
     });

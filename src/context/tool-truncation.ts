@@ -5,6 +5,7 @@
  */
 
 import type { ChatMessage } from '../ai/client.js';
+import { contentToText } from './content.js';
 
 // Constants for truncation (from OpenClaw)
 const CHARS_PER_TOKEN_ESTIMATE = 4;
@@ -77,14 +78,15 @@ export function truncateMessageIfToolResult(
     config?.maxShare ?? MAX_TOOL_RESULT_CONTEXT_SHARE
   );
 
-  if (!message.content || message.content.length <= maxChars) {
+  const content = contentToText(message.content);
+  if (!content || content.length <= maxChars) {
     return message;
   }
 
   return {
     ...message,
     content: truncateToolResult(
-      message.content,
+      content,
       maxChars,
       (config?.headChars ?? 0.3),
       (config?.tailChars ?? 0.3)
@@ -114,7 +116,7 @@ export function isOversizedToolResult(
   }
 
   const maxChars = calculateMaxToolResultChars(contextWindowTokens);
-  return (message.content?.length ?? 0) > maxChars;
+  return contentToText(message.content).length > maxChars;
 }
 
 /**

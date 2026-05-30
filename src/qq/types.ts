@@ -90,7 +90,7 @@ export interface QQConfig {
   splitLongMessages: boolean;
   typingIndicator: boolean;
   // Session processing options
-  parallelProcessing: boolean;  // Process multiple sessions in parallel
+  parallelProcessing: boolean;  // Preprocess multiple sessions in parallel; engine turns remain serialized
   accumulationDelay: number;    // Delay in ms to wait for message accumulation
 }
 
@@ -142,15 +142,57 @@ export interface QQFileInfo {
   mimeType?: string;
 }
 
+/** QQ Media Info for images/voice/video */
+export interface QQMediaInfo {
+  type: 'image' | 'record' | 'video';
+  fileId: string;
+  fileName: string;
+  fileSize?: number;
+  localPath?: string;
+  url?: string;
+  mimeType: string;
+  downloaded: boolean;
+  base64Data?: string;
+  senderId: number;
+  groupId?: number;
+  receivedAt: number;
+  // For voice
+  duration?: number;
+}
+
+/** Multimodal content for AI */
+export interface MultimodalContent {
+  type: 'text' | 'image_url' | 'input_audio';
+  text?: string;
+  image_url?: {
+    url: string;
+    detail?: 'low' | 'high' | 'auto';
+  };
+  input_audio?: {
+    data: string;
+    format: 'wav' | 'mp3';
+  };
+}
+
 /** QQ Tool parameters */
 export interface QQToolParams {
-  action: 'send_private_message' | 'send_group_message' | 'send_file';
+  action: 'send_private_message' | 'send_group_message' | 'send_file' | 'get_image' | 'get_voice' | 'get_media';
   user_id?: number;
   group_id?: number;
   message?: string;
   file_path?: string;
   file_name?: string;
+  file_id?: string;
+  media_type?: 'image' | 'voice';
   end?: boolean;
+}
+
+/** QQ Tool result */
+export interface QQToolResult {
+  success: boolean;
+  message: string;
+  isMultimodal?: boolean;
+  multimodalData?: string;
 }
 
 /** Default QQ config */
@@ -158,7 +200,7 @@ export const DEFAULT_QQ_CONFIG: QQConfig = {
   enabled: false,
   mode: 'websocket-server',
   port: 3002,
-  host: '0.0.0.0',
+  host: '127.0.0.1',
   autoFriendAccept: false,
   autoGroupInviteAccept: false,
   atRequiredInGroup: true,
@@ -166,7 +208,7 @@ export const DEFAULT_QQ_CONFIG: QQConfig = {
   splitLongMessages: true,
   typingIndicator: false,
   // Session processing defaults
-  parallelProcessing: true,   // Process sessions in parallel by default
+  parallelProcessing: false,  // Keep shared engine context serialized by default
   accumulationDelay: 400,     // 400ms delay for message accumulation (reduce spam, improve batching)
 };
 

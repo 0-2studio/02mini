@@ -5,6 +5,7 @@
 export { QQAdapter } from './adapter.js';
 export { QQConfigManager } from './config.js';
 export { createQQTools, executeQQTool } from './tools.js';
+export type { QQToolResult } from './types.js';
 export type {
   OneBotMessageEvent,
   OneBotMetaEvent,
@@ -14,6 +15,5 @@ export type {
   QQContext,
   QQSession,
   QQToolParams,
-  QQToolResult,
 } from './types.js';
 export { DEFAULT_QQ_CONFIG } from './types.js';

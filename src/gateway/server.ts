@@ -3,7 +3,7 @@
  * HTTP API and WebSocket gateway for 02mini
  */
 
-import Fastify from 'fastify';
+import Fastify, { type FastifyReply, type FastifyRequest } from 'fastify';
 import cors from '@fastify/cors';
 import websocket from '@fastify/websocket';
 import type { CoreEngine } from '../core/engine.js';
@@ -27,6 +27,7 @@ export class GatewayServer {
   private context: GatewayContext;
   private clients: Set<WebSocket> = new Set();
   private started: boolean = false;
+  private readonly allowedOrigins: string[];
 
   constructor(
     config: Partial<GatewayConfig>,
@@ -34,12 +35,16 @@ export class GatewayServer {
     cronScheduler: CronScheduler
   ) {
     this.config = {
-      port: config.port || 3000,
-      host: config.host || '0.0.0.0',
+      port: config.port ?? 3000,
+      host: config.host || '127.0.0.1',
       authToken: config.authToken,
       enableCORS: config.enableCORS ?? true,
       maxRequestSize: config.maxRequestSize || 10,
     };
+    this.allowedOrigins = (process.env.GATEWAY_CORS_ORIGINS || 'http://localhost,http://127.0.0.1')
+      .split(',')
+      .map(origin => origin.trim())
+      .filter(Boolean);
 
     this.context = {
       engine,
@@ -116,7 +121,14 @@ export class GatewayServer {
     // CORS
     if (this.config.enableCORS) {
       await this.app.register(cors, {
-        origin: true,
+        origin: (origin: string | undefined, cb: (err: Error | null, allow?: boolean) => void) => {
+          if (!origin) {
+            cb(null, true);
+            return;
+          }
+          const allowed = this.isAllowedOrigin(origin);
+          cb(allowed ? null : new Error('CORS origin denied'), allowed);
+        },
         credentials: true,
       });
     }
@@ -126,14 +138,8 @@ export class GatewayServer {
 
     // Authentication hook
     if (this.config.authToken) {
-      this.app.addHook('onRequest', async (request, reply) => {
-        // Skip auth for WebSocket upgrade
-        if (request.url === '/ws') return;
-
-        const authHeader = request.headers.authorization;
-        const token = authHeader?.replace('Bearer ', '');
-
-        if (token !== this.config.authToken) {
+      this.app.addHook('onRequest', async (request: FastifyRequest, reply: FastifyReply) => {
+        if (!this.isAuthorized(request)) {
           reply.status(401).send({ error: 'Unauthorized' });
         }
       });
@@ -156,7 +162,12 @@ export class GatewayServer {
     await this.app.register(createSessionRoutes(this.context), { prefix: '/api' });
 
     // WebSocket endpoint
-    this.app.get('/ws', { websocket: true }, (socket, req) => {
+    this.app.get('/ws', { websocket: true }, (socket: any, req: FastifyRequest) => {
+      if (this.config.authToken && !this.isAuthorized(req)) {
+        socket.close(1008, 'Unauthorized');
+        return;
+      }
+
       console.log('[Gateway] WebSocket client connected');
       this.clients.add(socket);
 
@@ -187,14 +198,14 @@ export class GatewayServer {
       });
 
       // Handle errors
-      socket.on('error', (error) => {
+      socket.on('error', (error: Error) => {
         console.error('[Gateway] WebSocket error:', error);
         this.clients.delete(socket);
       });
     });
 
     // 404 handler
-    this.app.setNotFoundHandler(async (request, reply) => {
+    this.app.setNotFoundHandler(async (request: FastifyRequest, reply: FastifyReply) => {
       reply.status(404).send({
         error: 'Not Found',
         message: `Route ${request.method} ${request.url} not found`,
@@ -207,6 +218,33 @@ export class GatewayServer {
           'WS /ws',
         ],
       });
+    });
+  }
+
+  private isAuthorized(request: FastifyRequest): boolean {
+    if (!this.config.authToken) return true;
+
+    const authHeader = request.headers.authorization;
+    const bearerToken = authHeader?.startsWith('Bearer ') ? authHeader.slice('Bearer '.length) : undefined;
+    const url = new URL(request.url, 'http://localhost');
+    const queryToken = url.searchParams.get('token') || undefined;
+    return bearerToken === this.config.authToken || queryToken === this.config.authToken;
+  }
+
+  private isAllowedOrigin(origin: string): boolean {
+    let requestOrigin: string;
+    try {
+      requestOrigin = new URL(origin).origin;
+    } catch {
+      return false;
+    }
+
+    return this.allowedOrigins.some((allowedOrigin) => {
+      try {
+        return new URL(allowedOrigin).origin === requestOrigin;
+      } catch {
+        return false;
+      }
     });
   }
 
@@ -225,7 +263,10 @@ export class GatewayServer {
       case 'message':
         // Process message through engine
         try {
-          const rawResponse = await this.context.engine.processUserInput(message.content);
+          this.context.recordActivity?.('gateway', message.sessionId || 'ws');
+          const rawResponse = await this.context.engine.processUserInput(
+            `[Gateway WebSocket Source session=${message.sessionId || 'default'}]\n${message.content}`
+          );
           // Strip message marker if present (prevents [MSG_ALREADY_SHOWN] from being sent)
           const response = stripMessageMarker(rawResponse);
           this.sendToSocket(socket, {
@@ -283,5 +324,9 @@ export class GatewayServer {
    */
   getContext(): GatewayContext {
     return this.context;
+  }
+
+  setActivityRecorder(recorder: (channel: 'gateway', session?: string) => void): void {
+    this.context.recordActivity = recorder;
   }
 }

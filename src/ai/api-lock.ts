@@ -50,6 +50,14 @@ class APICallLock {
     return this.active > 0;
   }
 
+  getStats(): { active: number; waiting: number; maxConcurrent: number } {
+    return {
+      active: this.active,
+      waiting: this.waiters.length,
+      maxConcurrent: this.maxConcurrent,
+    };
+  }
+
   /**
    * Execute a function with concurrency limiting.
    */

@@ -17,6 +17,14 @@
 - **HTTP API** - OpenAI 兼容的 API 接口
 - **WebSocket** - 实时双向通信
 
+## 当前行为说明
+
+- Gateway `/v1/chat/completions` 是 02mini agent gateway，不是透明 OpenAI proxy。它会把请求中的 `messages` 转成完整 transcript 后交给 02mini 引擎处理；自定义 tools 会被明确拒绝，stream 暂未支持。
+- Gateway `/api/send` 会按 `sessionId` 保存 API 层 user/assistant 历史，可通过 `/api/sessions/:id/history` 查询。底层 AI Engine 使用全局共享上下文，以保证 CLI/Gateway/QQ/Cron/Autonomous 信息互通；不同来源会在输入中带来源标签。
+- Cron 表达式使用主机本地时区。`tz` 字段不再作为有效调度能力暴露。
+- 控制台调试建议设置 `QQ_ENABLED=false` 和 `AUTONOMOUS_ENABLED=false`，避免连接 NapCat 或启动主动心跳。
+- 真实 QQ 配置不要提交。使用 `important/qq-config.example.json` 作为模板，真实 token 放在 `.env` 的 `QQ_TOKEN` 或本地 ignored 配置中。
+
 ## 快速开始
 
 ### 环境要求
@@ -59,6 +67,15 @@ GATEWAY_TOKEN=your-secret-token
 # 自主运行配置 (可选)
 AUTONOMOUS_ENABLED=true
 HEARTBEAT_INTERVAL=5
+AUTONOMOUS_MIN_INTERVAL=1
+AUTONOMOUS_MAX_INTERVAL=30
+AUTONOMY_LEVEL=assist # observe | assist | operate
+
+# KukeChat Bot 配置 (可选)
+KUKECHAT_ENABLED=false
+KUKECHAT_BOT_KEY=your-kukechat-bot-key
+KUKECHAT_BASE_URL=https://chat-api.kuke.ink/api/v1
+KUKECHAT_WS_URL=wss://chat-api.kuke.ink/bot/ws
 ```
 
 ### 运行
@@ -69,6 +86,12 @@ bun start
 
 # 编译
 bun run build
+
+# 静态检查
+bunx tsc --noEmit
+
+# 最小 smoke 验证
+bun run smoke
 
 # 运行编译版本
 node dist/index.js
@@ -97,6 +120,10 @@ node dist/index.js
 │   │   ├── store.ts
 │   │   └── tool.ts
 │   ├── qq/                  # QQ 机器人适配器
+│   │   ├── adapter.ts
+│   │   ├── tools.ts
+│   │   └── config.ts
+│   ├── kukechat/            # KukeChat Bot 适配器
 │   │   ├── adapter.ts
 │   │   ├── tools.ts
 │   │   └── config.ts
@@ -147,14 +174,77 @@ node dist/index.js
 |------|------|
 | `/help` | 显示帮助信息 |
 | `/skills` | 列出所有技能 |
-| `/mcp` | 列出 MCP 工具 |
+| `/tools` / `/mcp` | 列出 MCP 工具 |
 | `/read <file>` | 读取文件 |
-| `/write <file>` | 写入文件 |
+| `/runtime` | 显示模型、API、上下文、Cron、QQ 状态 |
+| `/doctor` | 本地 readiness 自检，不打印密钥 |
 | `/context` | 显示上下文窗口状态 |
 | `/compact` | 手动压缩对话历史 |
+| `/memory list|read|search` | 查看和搜索 memory/ |
+| `/jobs list|run|pause|resume|remove` | 管理 Cron jobs |
+| `/auto status|queue|log|cancel` | 查看自主运行状态、队列和日志 |
+| `/plan on|off|status` | CLI 计划模式 |
 | `/qq` | QQ 机器人管理 |
-| `/cron` | 定时任务管理 |
+| `/kuke` / `/kukechat` | KukeChat 连接状态 |
 | `/exit` | 退出程序 |
+
+## KukeChat Bot
+
+KukeChat 通过官方 Bot API 接入：
+
+- WebSocket 接收事件：`wss://chat-api.kuke.ink/bot/ws?key=...`
+- REST 发送消息：`POST /bot-api/conversations/{conversation_id}/messages`
+- REST 私信用户：`POST /bot-api/users/{user_id}/messages`
+
+启用方式：
+
+```env
+KUKECHAT_ENABLED=true
+KUKECHAT_BOT_KEY=your-kukechat-bot-key
+```
+
+收到 KukeChat 消息后会进入全局共享上下文，并带来源标签：
+
+```text
+[KukeChat Source conversation=123 message=1001 sender=88]
+```
+
+AI 回复 KukeChat 必须使用 `kukechat` 工具，支持：
+
+- `send_conversation_message`
+- `send_direct_message`
+- `get_me`
+- `get_conversation`
+
+KukeChat 消息可使用官方元素，例如 `<quote id="1001"/>`、`<at id="88"/>`、`<markdown>...</markdown>`。Bot Key 只放 `.env`，不要提交到仓库。
+
+## 自主运行
+
+02mini 的自主运行模块按 OpenClaw 风格设计：它不依赖用户每次发指令，而是通过 heartbeat、Cron、队列、通道活动和 memory 状态自行判断是否行动。
+
+### 自主等级
+
+| 等级 | 行为 |
+|------|------|
+| `observe` | 只观察状态，通常只报告重要问题，不主动执行队列 |
+| `assist` | 默认模式，会执行安全自维护、检查 overdue job、context pressure、tool health |
+| `operate` | 更主动地执行自主队列和持续维护任务 |
+
+### 持久化文件
+
+| 文件 | 用途 |
+|------|------|
+| `memory/autonomous-policy.json` | 自主目标、维护阈值、重复汇报窗口 |
+| `memory/autonomous-queue.json` | 自主工作队列，包含状态、优先级、重试和结果 |
+| `memory/autonomous-activity.jsonl` | 自主运行事件日志 |
+
+### 自主能力
+
+- 自适应 heartbeat：有事时加快，无事时放慢，错误时退避。
+- 自主 work queue：发现 overdue cron、context pressure、MCP 工具缺失、失败任务后自动入队。
+- 低噪声汇报：重复 proactive 消息会在 policy 窗口内被抑制。
+- 多通道感知：CLI、Gateway、QQ、Cron 活动会进入自主状态，影响后续判断。
+- 可观察但非人工驱动：`/auto status`、`/auto queue`、`/auto log` 用于查看运行情况。
 
 ## 技能系统
 

@@ -16,6 +16,7 @@ import {
   countConversationTokens,
   TOKEN_CONFIG,
 } from './tokens.js';
+import { contentToText } from './content.js';
 
 /**
  * Analyze message importance
@@ -58,7 +59,7 @@ function analyzeMessageImportance(
   }
   
   // Check for protected keywords
-  const content = message.content?.toLowerCase() || '';
+  const content = contentToText(message.content).toLowerCase();
   if (rules.protectKeywords.some(kw => content.includes(kw.toLowerCase()))) {
     importance = 'high';
     isProtected = true;
@@ -257,7 +258,7 @@ export function isCompleteToolChain(messages: ChatMessage[], startIndex: number)
   // Check if all tool calls have responses
   for (let i = startIndex + 1; i < messages.length; i++) {
     if (messages[i].role === 'tool' && messages[i].tool_call_id) {
-      toolCallIds.delete(messages[i].tool_call_id);
+      toolCallIds.delete(messages[i].tool_call_id!);
     }
   }
   

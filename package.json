@@ -8,7 +8,12 @@
     "start": "bun src/index.ts",
     "dev": "bun --watch src/index.ts",
     "build": "bun build src/index.ts --outdir=dist --target=node",
-    "clean": "rm -rf dist"
+    "clean": "bun -e \"await import('fs/promises').then(fs => fs.rm('dist', { recursive: true, force: true }))\"",
+    "smoke": "bun scripts/smoke.ts",
+    "smoke:kukechat": "bun scripts/kukechat-smoke.ts",
+    "memory:health": "bun scripts/memory-health.ts",
+    "memory:health:json": "bun scripts/memory-health.ts --json",
+    "memory:health:test": "bun scripts/memory-health.test.ts"
   },
   "keywords": ["ai", "mcp", "self-aware", "agent"],
   "author": "",

@@ -11,9 +11,23 @@ export interface AIConfig {
   maxTokens: number;
 }
 
+// Support for multimodal content (text, images, audio)
+export interface MultimodalContentItem {
+  type: 'text' | 'image_url' | 'input_audio';
+  text?: string;
+  image_url?: {
+    url: string;
+    detail?: 'low' | 'high' | 'auto';
+  };
+  input_audio?: {
+    data: string;
+    format: 'wav' | 'mp3';
+  };
+}
+
 export interface ChatMessage {
   role: 'system' | 'user' | 'assistant' | 'tool';
-  content: string;
+  content: string | MultimodalContentItem[];
   tool_calls?: ToolCallRequest[];
   tool_call_id?: string;
 }
@@ -107,6 +121,12 @@ export class AIClient {
         max_tokens: this.config.maxTokens,
       };
 
+      // Debug: Log the messages being sent, especially for multimodal content
+      const lastMessage = messages[messages.length - 1];
+      if (lastMessage && typeof lastMessage.content !== 'string') {
+        console.log('[AI] Sending multimodal message:', JSON.stringify(lastMessage.content).substring(0, 200));
+      }
+
       if (tools && tools.length > 0) {
         requestBody.tools = tools;
         requestBody.tool_choice = 'auto';
@@ -131,15 +151,10 @@ export class AIClient {
       if (!response.ok) {
         // Check for rate limit error (status 449)
         if (response.status === 449) {
-          console.log('[AI] Rate limit hit (status 449)');
-          return {
-            choices: [],
-            status: '449',
-            msg: 'You exceeded your current rate limit',
-          };
+          throw new Error('Rate limit exceeded (status 449)');
         }
         const error = await response.text();
-        throw new Error(`API error: ${response.status} - ${error}`);
+        throw new Error(`API error: ${response.status} - ${this.redactErrorBody(error)}`);
       }
 
       return await response.json() as ChatCompletionResponse;
@@ -155,5 +170,12 @@ export class AIClient {
 
   getModel(): string {
     return this.config.model;
+  }
+
+  private redactErrorBody(body: string): string {
+    return body
+      .replace(/(bearer\s+)[^\s"']+/gi, '$1[REDACTED]')
+      .replace(/((api[_-]?key|token|password|secret)["'\s:=]+)[^,"'\s}]+/gi, '$1[REDACTED]')
+      .slice(0, 1000);
   }
 }

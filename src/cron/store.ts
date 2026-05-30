@@ -56,11 +56,8 @@ export class CronStoreManager {
    */
   private async save(): Promise<void> {
     this.data.lastUpdated = new Date().toISOString();
-    try {
-      await fs.writeFile(this.storePath, JSON.stringify(this.data, null, 2), 'utf-8');
-    } catch (error) {
-      console.error('[CronStore] Failed to save:', error);
-    }
+    await fs.mkdir(path.dirname(this.storePath), { recursive: true });
+    await fs.writeFile(this.storePath, JSON.stringify(this.data, null, 2), 'utf-8');
   }
 
   /**

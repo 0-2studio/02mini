@@ -9,8 +9,10 @@ import { AIClient, type ChatMessage, type ToolDefinition } from '../ai/client.js
 import { globalApiLock } from '../ai/api-lock.js';
 import { globalKeyedApiLock } from '../ai/api-lock-keyed.js';
 import { globalCompactionLock } from '../ai/compaction-lock.js';
+import { AsyncMutex } from '../ai/mutex.js';
 import { CronScheduler, createCronTool, executeCronTool, type CronToolParams, type CronJob } from '../cron/index.js';
 import { ContextManager } from '../context/index.js';
+import { normalizeMultimodalContent } from '../context/content.js';
 import crypto from 'crypto';
 import fs from 'fs/promises';
 import path from 'path';
@@ -26,6 +28,13 @@ export interface EngineContext {
 
 /** Callback for cli-bridge messages */
 export type CliBridgeMessageHandler = (message: string) => void;
+
+type DynamicToolResult = string | {
+  success?: boolean;
+  message: string;
+  isMultimodal?: boolean;
+  multimodalData?: string;
+};
 
 /**
  * Strip the [MSG_ALREADY_SHOWN] marker from response
@@ -45,11 +54,22 @@ export function hasMessageMarker(response: string): boolean {
   return response?.startsWith('[MSG_ALREADY_SHOWN]') ?? false;
 }
 
+function redactForLog(value: unknown): string {
+  return JSON.stringify(value, (_key, innerValue) => {
+    if (typeof innerValue === 'string') {
+      if (/bearer\s+|token|api[_-]?key|password|secret/i.test(innerValue)) return '[REDACTED]';
+      if (innerValue.length > 300) return `${innerValue.slice(0, 300)}...[truncated]`;
+    }
+    return innerValue;
+  });
+}
+
 export class CoreEngine {
   private context: EngineContext;
   private systemPrompt: string;
   private aiClient: AIClient;
   private tools: ToolDefinition[] = [];
+  private mcpToolMap = new Map<string, { server: string; toolName: string }>();
   private contextManager: ContextManager;
   private cliBridgeHandler?: CliBridgeMessageHandler;
   private qqContext?: {
@@ -58,7 +78,11 @@ export class CoreEngine {
     allowedGroups: number[];
     allowedUsers: number[];
   };
-  private dynamicTools: Map<string, { tool: ToolDefinition; executor: (params: any) => Promise<string> }> = new Map();
+  private kukeChatContext?: {
+    enabled: boolean;
+  };
+  private dynamicTools: Map<string, { tool: ToolDefinition; executor: (params: any) => Promise<DynamicToolResult> }> = new Map();
+  private turnMutex = new AsyncMutex();
 
   /**
    * Per-engine lock key used with globalKeyedApiLock.
@@ -99,17 +123,31 @@ export class CoreEngine {
   }
 
   /**
-   * Get current context messages
+   * Get a snapshot of current context messages.
+   * External modules must not mutate the engine's internal message array directly.
    */
   getMessages(): ChatMessage[] {
-    return this.context.messages;
+    return [...this.context.messages];
   }
 
-  /**
-   * Replace messages (used for context compression)
-   */
-  setMessages(messages: ChatMessage[]): void {
-    this.context.messages = messages;
+  getMessagesSnapshot(): ChatMessage[] {
+    return [...this.context.messages];
+  }
+
+  async withContextLock<T>(fn: (messages: ChatMessage[]) => Promise<T>): Promise<T> {
+    return this.turnMutex.runExclusive(() => fn(this.context.messages));
+  }
+
+  async appendMessagesLocked(messages: ChatMessage[]): Promise<void> {
+    await this.turnMutex.runExclusive(async () => {
+      this.context.messages.push(...messages);
+    });
+  }
+
+  async replaceMessagesLocked(messages: ChatMessage[]): Promise<void> {
+    await this.turnMutex.runExclusive(async () => {
+      this.context.messages.splice(0, this.context.messages.length, ...messages);
+    });
   }
 
   /**
@@ -133,6 +171,7 @@ export class CoreEngine {
 
     // SHARE the same contextManager instance (for unified compaction)
     child.contextManager = this.contextManager;
+    child.turnMutex = this.turnMutex;
 
     // Copy dynamic tools so the fork can also use qq/cli-bridge etc.
     for (const [name, { tool, executor }] of this.dynamicTools.entries()) {
@@ -142,6 +181,7 @@ export class CoreEngine {
     // Copy handlers / context
     if (this.cliBridgeHandler) child.setCliBridgeHandler(this.cliBridgeHandler);
     if (this.qqContext) child.setQQContext(this.qqContext);
+    if (this.kukeChatContext) child.setKukeChatContext(this.kukeChatContext);
 
     // Ensure tools list includes dynamic tools
     child.buildTools();
@@ -163,7 +203,7 @@ export class CoreEngine {
   registerTool(
     name: string,
     tool: ToolDefinition,
-    executor: (params: any) => Promise<string>
+    executor: (params: any) => Promise<DynamicToolResult>
   ): void {
     this.dynamicTools.set(name, { tool, executor });
     // Rebuild tools to include the new one
@@ -184,6 +224,12 @@ export class CoreEngine {
     // Rebuild system prompt with QQ context
     this.systemPrompt = this.buildSystemPrompt();
     console.log('[Engine] QQ context updated in system prompt');
+  }
+
+  setKukeChatContext(context: { enabled: boolean }): void {
+    this.kukeChatContext = context;
+    this.systemPrompt = this.buildSystemPrompt();
+    console.log('[Engine] KukeChat context updated in system prompt');
   }
 
   private buildSystemPrompt(): string {
@@ -269,8 +315,8 @@ export class CoreEngine {
       '2. **every** - Recurring interval (in milliseconds)',
       '   Example: {"kind": "every", "everyMs": 60000}  // Every minute',
       '',
-      '3. **cron** - Cron expression',
-      '   Example: {"kind": "cron", "expr": "0 9 * * *"}  // Daily at 9:00',
+      '3. **cron** - Cron expression using host local time',
+      '   Example: {"kind": "cron", "expr": "0 9 * * *"}  // Daily at 9:00 host local time',
       '   Format: minute hour day month weekday',
       '',
       '### Payload Types',
@@ -294,6 +340,7 @@ export class CoreEngine {
       '4. Analyze the content and provide accurate answers',
       '',
       this.buildQQPrompt(),
+      this.buildKukeChatPrompt(),
       '',
       'Remember: Each conversation turn costs resources. Be efficient - complete tasks in as few steps as possible.',
     ].join('\n');
@@ -330,18 +377,40 @@ export class CoreEngine {
     return lines.join('\n');
   }
 
+  private buildKukeChatPrompt(): string {
+    if (!this.kukeChatContext?.enabled) return '';
+
+    return [
+      '## KukeChat Bot Module',
+      '',
+      'You are connected to KukeChat via its Bot API.',
+      'Incoming messages are marked like: [KukeChat Source conversation=... message=... sender=...]',
+      'To reply, use the kukechat tool. Do not merely write a reply in normal assistant text if the user expects a KukeChat response.',
+      '',
+      'Useful KukeChat message elements:',
+      '- Quote a message: <quote id="MESSAGE_ID"/>',
+      '- Mention a user: <at id="USER_ID"/>',
+      '- Markdown: <markdown># Title\nContent</markdown>',
+      '',
+      'For one incoming KukeChat message, avoid duplicate replies. Use end=true when done.',
+    ].join('\n');
+  }
+
   private buildTools(): void {
     // Reset tools each time we rebuild to avoid duplicates.
     this.tools = [];
+    this.mcpToolMap.clear();
 
     // Build tools from MCP servers
     const mcpTools = this.context.mcpManager.getAllTools();
 
     for (const { server, tool } of mcpTools) {
+      const exposedName = `${server}_${tool.name}`;
+      this.mcpToolMap.set(exposedName, { server, toolName: tool.name });
       this.tools.push({
         type: 'function',
         function: {
-          name: `${server}_${tool.name}`,
+          name: exposedName,
           description: `[${server}] ${tool.description}`,
           parameters: tool.inputSchema || { type: 'object', properties: {} },
         },
@@ -425,7 +494,14 @@ export class CoreEngine {
     console.log(`[Engine] Built ${this.tools.length} tools`);
   }
 
-  async processUserInput(input: string, abortSignal?: AbortSignal): Promise<string> {
+  async processUserInput(
+    input: string,
+    abortSignal?: AbortSignal
+  ): Promise<string> {
+    return this.turnMutex.runExclusive(() => this.processUserInputUnlocked(input, abortSignal));
+  }
+
+  private async processUserInputUnlocked(input: string, abortSignal?: AbortSignal): Promise<string> {
     // CRITICAL: Wait for any ongoing compaction to complete
     await this.contextManager.waitForCompaction();
 
@@ -452,12 +528,11 @@ export class CoreEngine {
     // Add user message
     this.context.messages.push({ role: 'user', content: input });
 
-    // Check and compact context if needed (before sending to AI)
-    const compactResult = await this.contextManager.checkAndCompact(this.context.messages);
-    if (compactResult.compacted && compactResult.report) {
-      console.log(`[Context] Compressed ${compactResult.report.originalMessages}→${compactResult.report.compressedMessages} messages ` +
-        `(${compactResult.report.originalTokens}→${compactResult.report.compressedTokens} tokens)`);
-      this.context.messages = compactResult.messages;
+    // Keep context bounded for all entry points. This runs under the turn mutex,
+    // so no other engine turn can mutate messages while compaction is applied.
+    const compaction = await this.contextManager.checkAndCompact(this.context.messages, { silent: true });
+    if (compaction.compacted) {
+      this.context.messages.splice(0, this.context.messages.length, ...compaction.messages);
     }
 
     // Run the conversation loop
@@ -497,9 +572,27 @@ export class CoreEngine {
       console.log(`[Engine] Conversation iteration ${iteration}`);
 
       // Build messages with system prompt that includes current time
+      // Parse multimodal content (JSON strings) into arrays for proper OpenAI format
+      const parsedMessages: ChatMessage[] = this.context.messages.map(msg => {
+        if (typeof msg.content === 'string' && msg.content.startsWith('[')) {
+          try {
+            const parsed = JSON.parse(msg.content);
+            const multimodal = normalizeMultimodalContent(parsed);
+            if (multimodal) {
+              // This is multimodal content, return as array
+              return { ...msg, content: multimodal };
+            }
+          } catch {
+            // Not valid JSON array, keep as string
+          }
+        }
+        return msg;
+      });
+
+      const sanitizedMessages = this.sanitizeToolTranscript(parsedMessages);
       const messages: ChatMessage[] = [
         { role: 'system', content: this.buildDynamicSystemPrompt() },
-        ...this.context.messages,
+        ...sanitizedMessages,
       ];
 
       // Call AI with tools using global lock
@@ -601,22 +694,34 @@ export class CoreEngine {
           toolResults.push({ id: toolCall.id, result, shouldAddReminder });
         }
 
+        // Process all tool results
         for (const tr of toolResults) {
-          let finalResult = tr.result;
-          
-          // Add reminder after qq tool call to guide AI to stop properly
-          if (tr.shouldAddReminder) {
-            finalResult += '\n\n---\n**MESSAGE SENT**\n';
-            finalResult += '- If you are DONE and no more actions needed → Reply "NO" to end conversation\n';
-            finalResult += '- If you need to do MORE actions → Continue with next tool call\n';
-            finalResult += '- DO NOT send duplicate messages to the same user/group';
+          // Check if this is a multimodal image result
+          if (tr.result === '[MULTIMODAL_IMAGE_ADDED]') {
+            // Multimodal image was already added as user message in executeToolCall
+            // Add a STRONG tool message telling AI NOT to download
+            this.context.messages.push({
+              role: 'tool',
+              content: '[SUCCESS] Image has been transmitted to you via multimodal API. You can NOW SEE the image directly in the conversation above.\n\n[CRITICAL] DO NOT use code-runner or any download tools! The image is ALREADY visible to you!\n\n[YOUR TASK] Describe or analyze the image content you see above. NO additional tools needed!',
+              tool_call_id: tr.id,
+            });
+          } else {
+            let finalResult = tr.result;
+
+            // Add reminder after qq tool call to guide AI to stop properly
+            if (tr.shouldAddReminder) {
+              finalResult += '\n\n---\n**MESSAGE SENT**\n';
+              finalResult += '- If you are DONE and no more actions needed → Reply "NO" to end conversation\n';
+              finalResult += '- If you need to do MORE actions → Continue with next tool call\n';
+              finalResult += '- DO NOT send duplicate messages to the same user/group';
+            }
+
+            this.context.messages.push({
+              role: 'tool',
+              content: finalResult,
+              tool_call_id: tr.id,
+            });
           }
-          
-          this.context.messages.push({
-            role: 'tool',
-            content: finalResult,
-            tool_call_id: tr.id,
-          });
         }
 
         if (shouldEndConversation) {
@@ -676,7 +781,7 @@ export class CoreEngine {
 
     try {
       const toolArgs = JSON.parse(toolArgsStr);
-      console.log(`[Engine] Params: ${JSON.stringify(toolArgs)}`);
+      console.log(`[Engine] Params: ${redactForLog(toolArgs)}`);
 
       // Record this tool call for repetition detection
       this.recentToolCalls.push({
@@ -710,7 +815,43 @@ export class CoreEngine {
           this.qqToolCalledInSession = true;
           console.log('[Engine] qq tool called, marking session');
         }
-        resultText = await dynamicTool.executor(toolArgs);
+        const result = await dynamicTool.executor(toolArgs);
+        
+        // Check if result is multimodal (e.g., from get_image)
+        if (typeof result === 'object' && result.isMultimodal) {
+          // Use multimodalData field if available, otherwise fall back to message
+          const multimodalJson = result.multimodalData || result.message;
+          if (multimodalJson) {
+            try {
+              const multimodalContent = normalizeMultimodalContent(JSON.parse(multimodalJson));
+              if (multimodalContent && multimodalContent.length > 0) {
+                // Check if this contains an image
+                const hasImage = multimodalContent.some(item => item.type === 'image_url' && item.image_url?.url);
+
+                if (hasImage) {
+                  // Add multimodal content as USER message so AI can "see" the image
+                  console.log('[Engine] Multimodal image detected, adding as user message');
+                  console.log('[Engine] Multimodal content:', JSON.stringify(multimodalContent).substring(0, 200));
+
+                  // Add the multimodal content directly - the tool message will explain
+                  this.context.messages.push({
+                    role: 'user',
+                    content: multimodalContent, // Add as array (parsed)
+                  });
+
+                  console.log('[Engine] Added multimodal message to context, total messages:', this.context.messages.length);
+
+                  // Return special marker
+                  return `[MULTIMODAL_IMAGE_ADDED]`;
+                }
+              }
+            } catch (e) {
+              console.error('[Engine] Failed to parse multimodal content:', e);
+            }
+          }
+        }
+        
+        resultText = typeof result === 'string' ? result : result.message;
       }
 
       // Check if it's a skill (no underscore prefix)
@@ -724,18 +865,12 @@ export class CoreEngine {
       }
 
       // It's an MCP tool
-      else {
-        const underscoreIndex = fullToolName.indexOf('_');
-        if (underscoreIndex === -1) {
-          throw new Error(`Invalid tool name format: ${fullToolName}`);
-        }
-
-        const serverName = fullToolName.substring(0, underscoreIndex);
-        const toolName = fullToolName.substring(underscoreIndex + 1);
+      else if (this.mcpToolMap.has(fullToolName)) {
+        const mapping = this.mcpToolMap.get(fullToolName)!;
 
         const result = await this.context.mcpManager.callToolOnServer(
-          serverName,
-          toolName,
+          mapping.server,
+          mapping.toolName,
           toolArgs
         );
 
@@ -748,12 +883,70 @@ export class CoreEngine {
         resultText = result.content?.[0]?.text || 'Success';
       }
 
+      else {
+        throw new Error(`Unknown tool/skill: ${fullToolName}`);
+      }
+
       return resultText;
     } catch (error) {
       const errorMsg = error instanceof Error ? error.message : String(error);
       console.log(`[Engine] Tool execution error: ${errorMsg}`);
       return `Error executing tool: ${errorMsg}`;
     }
+  }
+
+  private sanitizeToolTranscript(messages: ChatMessage[]): ChatMessage[] {
+    const sanitized: ChatMessage[] = [];
+    const pendingToolCallIds = new Set<string>();
+    let dropped = 0;
+
+    for (const message of messages) {
+      if (message.role === 'assistant' && message.tool_calls?.length) {
+        sanitized.push(message);
+        for (const toolCall of message.tool_calls) {
+          pendingToolCallIds.add(toolCall.id);
+        }
+        continue;
+      }
+
+      if (message.role === 'tool') {
+        if (message.tool_call_id && pendingToolCallIds.has(message.tool_call_id)) {
+          sanitized.push(message);
+          pendingToolCallIds.delete(message.tool_call_id);
+        } else {
+          dropped++;
+        }
+        continue;
+      }
+
+      if (pendingToolCallIds.size > 0) {
+        const last = sanitized[sanitized.length - 1];
+        if (last?.role === 'assistant' && last.tool_calls?.some(call => pendingToolCallIds.has(call.id))) {
+          sanitized.pop();
+          dropped++;
+        }
+        pendingToolCallIds.clear();
+      }
+
+      sanitized.push(message);
+    }
+
+    if (pendingToolCallIds.size > 0) {
+      for (let i = sanitized.length - 1; i >= 0; i--) {
+        const message = sanitized[i];
+        if (message.role === 'assistant' && message.tool_calls?.some(call => pendingToolCallIds.has(call.id))) {
+          sanitized.splice(i, 1);
+          dropped++;
+          break;
+        }
+      }
+    }
+
+    if (dropped > 0) {
+      console.warn(`[Engine] Sanitized ${dropped} orphaned/incomplete tool transcript message(s) before AI call`);
+    }
+
+    return sanitized;
   }
 
   private async executeSkillByName(skill: Skill, params: Record<string, unknown>): Promise<string> {
@@ -781,8 +974,8 @@ export class CoreEngine {
     return this.systemPrompt;
   }
 
-  getMessages(): ChatMessage[] {
-    return this.context.messages;
+  getWorkingDir(): string {
+    return this.context.workingDir;
   }
 
   getContextStatus(): string {
@@ -793,23 +986,45 @@ export class CoreEngine {
     return this.contextManager.getStats(this.context.messages);
   }
 
+  getRuntimeStatus() {
+    return {
+      model: this.aiClient.getModel(),
+      tools: this.tools.length,
+      mcpTools: this.mcpToolMap.size,
+      messages: this.context.messages.length,
+      api: globalApiLock.getStats(),
+      keyedApiLocks: globalKeyedApiLock.inProgressKeys(),
+      compactionInProgress: this.contextManager.isCompactionInProgress(),
+    };
+  }
+
   async forceCompaction(level: 'light' | 'medium' | 'heavy' | 'emergency' = 'medium'): Promise<string> {
     const result = await this.contextManager.forceCompaction(this.context.messages, level);
     if (result.report) {
-      this.context.messages = result.messages;
+      this.context.messages.splice(0, this.context.messages.length, ...result.messages);
       return `Context compacted: ${result.report.originalMessages}→${result.report.compressedMessages} messages, ` +
         `${result.report.originalTokens}→${result.report.compressedTokens} tokens (${result.report.savedPercentage.toFixed(1)}% saved)`;
     }
     return 'No compaction performed';
   }
 
-  async processProactive(prompt: string): Promise<string> {
-    this.context.messages.push({
-      role: 'system',
-      content: prompt,
-    });
+  async resetAllData(): Promise<{ success: boolean; message: string }> {
+    this.context.messages.splice(0, this.context.messages.length);
+    this.contextManager.resetHistory();
+    this.qqToolCalledInSession = false;
+    this.recentToolCalls = [];
+    return { success: true, message: 'Conversation history and context state cleared' };
+  }
 
-    return await this.runConversationLoop();
+  async processProactive(prompt: string): Promise<string> {
+    return this.turnMutex.runExclusive(async () => {
+      this.context.messages.push({
+        role: 'system',
+        content: `[Autonomous Source]\n${prompt}`,
+      });
+
+      return await this.runConversationLoop();
+    });
   }
 
   private extractCliBridgeMessage(argsJson: string): string {
@@ -852,22 +1067,24 @@ export class CoreEngine {
   }
 
   async handleSystemEvents(): Promise<string[]> {
-    const events = this.context.cronScheduler.getPendingSystemEvents();
-    if (events.length === 0) return [];
+    return this.turnMutex.runExclusive(async () => {
+      const events = this.context.cronScheduler.getPendingSystemEvents();
+      if (events.length === 0) return [];
 
-    console.log(`[Engine] Handling ${events.length} pending system event(s)`);
-    const responses: string[] = [];
+      console.log(`[Engine] Handling ${events.length} pending system event(s)`);
+      const responses: string[] = [];
 
-    for (const event of events) {
-      const systemMessage = `[Scheduled Reminder] ${event.text}`;
-      this.context.messages.push({ role: 'user', content: systemMessage });
+      for (const event of events) {
+        const systemMessage = `[Cron SystemEvent Source]\n[Scheduled Reminder] ${event.text}`;
+        this.context.messages.push({ role: 'user', content: systemMessage });
 
-      const response = await this.processUserInput('');
-      responses.push(response);
-    }
+        const response = await this.runConversationLoop();
+        responses.push(response);
+      }
 
-    this.context.cronScheduler.clearSystemEvents();
-    return responses;
+      this.context.cronScheduler.clearSystemEvents();
+      return responses;
+    });
   }
 
   async handleAgentTurn(job: CronJob): Promise<string> {
@@ -876,11 +1093,13 @@ export class CoreEngine {
     if (job.payload.kind !== 'agentTurn') {
       return '[Error: Not an agentTurn payload]';
     }
+    const payload = job.payload;
 
-    const systemMessage = `[Scheduled Task] ${job.name}: ${job.payload.message}`;
-    this.context.messages.push({ role: 'user', content: systemMessage });
-
-    return await this.processUserInput(job.payload.message);
+    return await this.turnMutex.runExclusive(async () => {
+      const systemMessage = `[Cron AgentTurn Source]\n[Scheduled Task] ${job.name}: ${payload.message}`;
+      this.context.messages.push({ role: 'user', content: systemMessage });
+      return await this.runConversationLoop();
+    });
   }
 
   async checkCronEvents(): Promise<void> {

@@ -33,7 +33,8 @@ export class MCPManager {
       for (const configPath of configPaths) {
         try {
           await this.loadConfig(configPath);
-          if (Object.keys(this.config?.mcpServers || {}).length > 0) {
+          const loadedConfig = this.config as MCPConfig | undefined;
+          if (loadedConfig && Object.keys(loadedConfig.mcpServers).length > 0) {
             console.log(`[MCP] Loaded config from ${configPath}`);
             break;
           }

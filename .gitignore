@@ -113,3 +113,35 @@ coverage/
 memory/skills-inventory.md
 important/qq-config.json
 memory/user-profile.md
+
+# ----- 02mini Runtime Memory (local user/agent state) -----
+# Keep memory files on disk for the running agent, but do not publish them.
+memory/**
+!memory/
+!memory/README.md
+!memory/**/
+!memory/**/.gitkeep
+
+# Autonomous runtime state
+memory/autonomous-activity.jsonl
+memory/autonomous-queue.json
+memory/autonomous-policy.json
+memory/health-report.md
+memory/CORE-MEMORY.md
+memory/INDEX.md
+
+# ----- Local generated artifacts -----
+dist-check/
+rss.xml
+tmp-*
+*.tmp
+
+# Chat platform local media/runtime files
+files/kukechat-uploads/
+files/kukechat-media/
+files/qq-media/
+
+# Private agent-authored projects/scripts/skills
+docs/projects/
+scripts/
+skills/

@@ -109,6 +109,8 @@ QQ_NAPCAT_URL=ws://localhost:3001
 
 ## 4. 配置 02mini
 
+不要提交真实 QQ token。仓库只应保留 `important/qq-config.example.json` 模板；真实 token 推荐放在 `.env` 的 `QQ_TOKEN`，或保存在本地被 `.gitignore` 忽略的 `important/qq-config.json`。
+
 ### 4.1 启用 QQ 模块
 
 ```bash

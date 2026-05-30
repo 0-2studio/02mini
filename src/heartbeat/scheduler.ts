@@ -61,8 +61,11 @@ export class HeartbeatScheduler extends EventEmitter {
       this.tasks = this.parseHeartbeatFile(content);
       console.log(`[Heartbeat] Loaded ${this.tasks.length} legacy tasks from heartbeat.md`);
       
-      // Convert legacy tasks to cron jobs
-      await this.convertLegacyTasks();
+      // Legacy heartbeat tasks are kept as readable documentation only.
+      // Do NOT auto-convert them into cron jobs: these obsolete tasks caused
+      // 62 redundant [Legacy] jobs to be recreated on every restart after
+      // cleanup, bloating memory/cron-store.json and triggering noisy events.
+      console.log('[Heartbeat] Legacy task auto-conversion disabled');
     } catch (error) {
       console.log('[Heartbeat] No heartbeat file found or error reading it');
       this.tasks = this.getDefaultTasks();

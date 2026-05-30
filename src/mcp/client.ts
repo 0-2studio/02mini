@@ -23,6 +23,7 @@ export class MCPClient extends EventEmitter {
   }
 
   async connect(): Promise<void> {
+    let timeout: NodeJS.Timeout | undefined;
     try {
       // Create client
       this.client = new Client(
@@ -34,16 +35,17 @@ export class MCPClient extends EventEmitter {
       this.transport = new StdioClientTransport({
         command: this.config.command,
         args: this.config.args,
-        env: { ...process.env, ...(this.config.env || {}) } as Record<string, string>,
+        env: this.buildEnv(),
       });
 
       // Connect with timeout (30 seconds)
       const connectPromise = this.client.connect(this.transport);
       const timeoutPromise = new Promise((_, reject) => {
-        setTimeout(() => reject(new Error('Connection timeout')), 30000);
+        timeout = setTimeout(() => reject(new Error('Connection timeout')), 30000);
       });
 
       await Promise.race([connectPromise, timeoutPromise]);
+      if (timeout) clearTimeout(timeout);
 
       // List tools
       const toolsResponse = await this.client.request(
@@ -67,10 +69,25 @@ export class MCPClient extends EventEmitter {
 
       this.emit('connected', { name: this.name, tools: this.tools.length });
     } catch (error) {
+      if (timeout) clearTimeout(timeout);
       console.error(`[MCP:${this.name}] Connection failed:`, error);
       this.emit('error', error);
+      this.disconnect();
       throw error;
     }
+  }
+
+  private buildEnv(): Record<string, string> {
+    const allowedKeys = (process.env.MCP_ENV_ALLOWLIST || 'PATH,Path,HOME,USERPROFILE,TEMP,TMP,SystemRoot,COMSPEC')
+      .split(',')
+      .map(key => key.trim())
+      .filter(Boolean);
+    const env: Record<string, string> = {};
+    for (const key of allowedKeys) {
+      const value = process.env[key];
+      if (value !== undefined) env[key] = value;
+    }
+    return { ...env, ...(this.config.env || {}) };
   }
 
   async callTool(toolName: string, args: Record<string, unknown>): Promise<MCPCallToolResult> {

@@ -5,6 +5,7 @@
  */
 
 import type { ChatMessage } from '../ai/client.js';
+import { contentToText } from './content.js';
 import type { 
   CompactionResult, 
   SummaryBlock, 
@@ -23,7 +24,7 @@ function createSimpleSummary(messages: ChatMessage[]): string {
   const assistantMsgs = messages.filter(m => m.role === 'assistant');
   
   const topics = userMsgs.slice(-3).map(m => {
-    const content = m.content || '';
+    const content = contentToText(m.content);
     // Extract first sentence or first 50 chars
     const firstSentence = content.split(/[.!?。！？]/)[0];
     return firstSentence.slice(0, 50) + (firstSentence.length > 50 ? '...' : '');
@@ -40,7 +41,7 @@ export function extractKeyFacts(messages: ChatMessage[]): KeyFact[] {
   
   for (let i = 0; i < messages.length; i++) {
     const msg = messages[i];
-    const content = msg.content || '';
+    const content = contentToText(msg.content);
     
     // Look for facts in user messages
     if (msg.role === 'user') {
@@ -142,8 +143,8 @@ export async function mediumCompaction(
     aiClient
   );
   
-  // Combine summary with kept messages
-  const finalMessages = [summaryMessage, ...keptMessages.filter(m => m.role !== 'system')];
+  // aiMediumCompaction already includes the summary in keptMessages.
+  const finalMessages = keptMessages;
   const { total: compressedTokens } = countConversationTokens(finalMessages);
   
   // Calculate removed indices
@@ -161,6 +162,7 @@ export async function mediumCompaction(
     removedIndices,
     summarizedBlocks: summaryBlocks,
     success: compressedTokens <= targetTokens * 1.2,
+    messages: finalMessages,
   };
 }
 
@@ -181,8 +183,8 @@ export async function heavyCompaction(
     aiClient
   );
   
-  // Combine summary with kept messages
-  const finalMessages = [summaryMessage, ...keptMessages.filter(m => m.role !== 'system')];
+  // aiHeavyCompaction already includes the summary in keptMessages.
+  const finalMessages = keptMessages;
   const { total: compressedTokens } = countConversationTokens(finalMessages);
   
   // Calculate removed indices
@@ -200,6 +202,7 @@ export async function heavyCompaction(
     removedIndices,
     summarizedBlocks: summaryBlocks,
     success: compressedTokens <= targetTokens * 1.2,
+    messages: finalMessages,
   };
 }
 
@@ -221,8 +224,8 @@ export async function lightCompaction(
     aiClient
   );
   
-  // Combine summary with kept messages
-  const finalMessages = [summaryMessage, ...keptMessages.filter(m => m.role !== 'system')];
+  // aiLightCompaction already includes the summary in keptMessages.
+  const finalMessages = keptMessages;
   const { total: compressedTokens } = countConversationTokens(finalMessages);
   
   // Calculate removed indices (all non-system messages that were summarized)
@@ -240,6 +243,7 @@ export async function lightCompaction(
     removedIndices,
     summarizedBlocks: summaryBlocks,
     success: compressedTokens <= targetTokens * 1.2,
+    messages: finalMessages,
   };
 }
 
@@ -261,8 +265,8 @@ export async function emergencyCompaction(
     aiClient
   );
   
-  // Combine summary with kept messages
-  const finalMessages = [summaryMessage, ...keptMessages.filter(m => m.role !== 'system')];
+  // aiEmergencyCompaction already includes the summary in keptMessages.
+  const finalMessages = keptMessages;
   const { total: compressedTokens } = countConversationTokens(finalMessages);
   
   // Calculate removed indices
@@ -280,6 +284,7 @@ export async function emergencyCompaction(
     removedIndices,
     summarizedBlocks: summaryBlocks,
     success: compressedTokens <= maxTokens,
+    messages: finalMessages,
   };
 }
 

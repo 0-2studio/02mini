@@ -7,6 +7,7 @@ import type { ChatMessage } from '../ai/client.js';
 import { globalApiLock } from '../ai/api-lock.js';
 import type { SummaryBlock } from './types.js';
 import { countMessageTokens, countConversationTokens } from './tokens.js';
+import { contentToText } from './content.js';
 
 /**
  * Build summarization prompt for AI
@@ -16,8 +17,9 @@ function buildSummarizationPrompt(messages: ChatMessage[]): string {
     const role = msg.role === 'user' ? 'User' : 
                  msg.role === 'assistant' ? 'Assistant' : 
                  msg.role === 'system' ? 'System' : 'Tool';
-    const content = msg.content?.slice(0, 500) || '';
-    if (msg.content && msg.content.length > 500) {
+    const fullContent = contentToText(msg.content);
+    const content = fullContent.slice(0, 500);
+    if (fullContent.length > 500) {
       return `[${idx}] ${role}: ${content}... (truncated)`;
     }
     return `[${idx}] ${role}: ${content}`;
@@ -127,7 +129,7 @@ function createSimpleSummary(messages: ChatMessage[]): {
   
   // Extract topics from user messages
   const topics = userMsgs.slice(-3).map(m => {
-    const content = m.content || '';
+    const content = contentToText(m.content);
     const firstSentence = content.split(/[.!?。！？]/)[0];
     return firstSentence.slice(0, 50) + (firstSentence.length > 50 ? '...' : '');
   });
@@ -146,7 +148,7 @@ ${toolCalls > 0 ? `Tool calls made: ${toolCalls}` : ''}`;
   // Extract simple key facts
   const keyFacts: string[] = [];
   for (const msg of userMsgs) {
-    const content = msg.content || '';
+    const content = contentToText(msg.content);
     if (content.match(/(important|remember|critical|preference)/i)) {
       keyFacts.push(content.slice(0, 100));
     }

@@ -16,6 +16,7 @@ export function createSessionRoutes(context: GatewayContext) {
         createdAt: number;
         lastActivity: number;
         messageCount: number;
+        historyMessages: number;
       }> = [];
 
       for (const [id, session] of context.sessions) {
@@ -24,6 +25,7 @@ export function createSessionRoutes(context: GatewayContext) {
           createdAt: session.createdAt,
           lastActivity: session.lastActivity,
           messageCount: session.messageCount,
+          historyMessages: session.messages.length,
         });
       }
 
@@ -38,6 +40,7 @@ export function createSessionRoutes(context: GatewayContext) {
         createdAt: Date.now(),
         lastActivity: Date.now(),
         messageCount: 0,
+        messages: [],
       };
 
       context.sessions.set(id, session);
@@ -55,16 +58,14 @@ export function createSessionRoutes(context: GatewayContext) {
     app.get('/sessions/:id/history', async (request, reply) => {
       const { id } = request.params as { id: string };
 
-      // For now, return global history (02mini currently uses single session)
-      const messages = context.engine.getMessages();
+      if (!context.sessions.has(id)) {
+        reply.status(404).send({ error: 'Session not found' });
+        return;
+      }
 
       return {
         sessionId: id,
-        messages: messages.map((m) => ({
-          role: m.role,
-          content: m.content,
-          timestamp: Date.now(), // Messages don't currently store timestamps
-        })),
+        messages: context.sessions.get(id)!.messages,
       };
     });
 
@@ -83,6 +84,11 @@ export function createSessionRoutes(context: GatewayContext) {
 
     // POST /api/reset
     app.post('/reset', async (request, reply) => {
+      if (!context.config.authToken) {
+        reply.status(401).send({ error: 'Reset requires GATEWAY_TOKEN to be configured' });
+        return;
+      }
+
       try {
         const result = await context.engine.resetAllData();
         return {

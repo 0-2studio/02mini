@@ -19,12 +19,29 @@ export function createChatRoutes(context: GatewayContext) {
           role: 'system' | 'user' | 'assistant' | 'tool';
           content: string;
         }>;
+        tools?: unknown[];
         stream?: boolean;
         temperature?: number;
         max_tokens?: number;
       };
 
       try {
+        if (body.stream) {
+          reply.status(501).send({
+            error: 'Not Implemented',
+            message: 'Streaming chat completions are not supported yet',
+          });
+          return;
+        }
+
+        if (body.tools && body.tools.length > 0) {
+          reply.status(400).send({
+            error: 'Bad Request',
+            message: 'Custom tools are not supported by the 02mini agent gateway; built-in MCP/cron/skill tools are used automatically',
+          });
+          return;
+        }
+
         // Validate messages
         if (!body.messages || !Array.isArray(body.messages) || body.messages.length === 0) {
           reply.status(400).send({
@@ -47,8 +64,13 @@ export function createChatRoutes(context: GatewayContext) {
           return;
         }
 
-        // Process through engine
-        const rawResponse = await context.engine.processUserInput(lastUserMessage.content);
+        const transcript = body.messages
+          .map((m) => `${m.role.toUpperCase()}: ${m.content}`)
+          .join('\n\n');
+
+        // Process the full caller-provided transcript through the 02mini agent engine.
+        context.recordActivity?.('gateway', 'chat-completions');
+        const rawResponse = await context.engine.processUserInput(`[Gateway ChatCompletions Source]\n${transcript}`);
         // Strip message marker if present (prevents [MSG_ALREADY_SHOWN] from being sent)
         const response = stripMessageMarker(rawResponse);
 
@@ -69,9 +91,9 @@ export function createChatRoutes(context: GatewayContext) {
             },
           ],
           usage: {
-            prompt_tokens: lastUserMessage.content.length / 4, // Rough estimate
+            prompt_tokens: body.messages.reduce((sum, m) => sum + m.content.length, 0) / 4, // Rough estimate
             completion_tokens: response.length / 4,
-            total_tokens: (lastUserMessage.content.length + response.length) / 4,
+            total_tokens: (body.messages.reduce((sum, m) => sum + m.content.length, 0) + response.length) / 4,
           },
         };
 
@@ -91,7 +113,6 @@ export function createChatRoutes(context: GatewayContext) {
       const body = request.body as {
         message: string;
         sessionId?: string;
-        useHistory?: boolean;
       };
 
       try {
@@ -105,11 +126,24 @@ export function createChatRoutes(context: GatewayContext) {
 
         // Generate or use session ID
         const sessionId = body.sessionId || randomUUID();
+        const session = context.sessions.get(sessionId) || {
+          id: sessionId,
+          createdAt: Date.now(),
+          lastActivity: Date.now(),
+          messageCount: 0,
+          messages: [],
+        };
+        session.lastActivity = Date.now();
+        session.messageCount++;
+        session.messages.push({ role: 'user', content: body.message, timestamp: Date.now() });
+        context.sessions.set(sessionId, session);
+        context.recordActivity?.('gateway', sessionId);
 
         // Process through engine
-        const rawResponse = await context.engine.processUserInput(body.message);
+        const rawResponse = await context.engine.processUserInput(`[Gateway Send Source session=${sessionId}]\n${body.message}`);
         // Strip message marker if present
         const response = stripMessageMarker(rawResponse);
+        session.messages.push({ role: 'assistant', content: response, timestamp: Date.now() });
 
         reply.send({
           success: true,

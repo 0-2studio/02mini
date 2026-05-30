@@ -9,8 +9,10 @@ import { MCPManager, mcpManager } from '../mcp/manager.js';
 import { SkillRegistry } from '../skills-impl/skill-registry.js';
 import { AIClient } from '../ai/client.js';
 import { CronScheduler } from '../cron/index.js';
+import type { AutonomousRunner } from '../autonomous/index.js';
 import type { ProactiveTrigger } from '../autonomous/types.js';
 import type { QQAdapter, QQConfigManager } from '../qq/index.js';
+import type { KukeChatAdapter } from '../kukechat/index.js';
 import fs from 'fs/promises';
 import path from 'path';
 
@@ -66,10 +68,14 @@ export class CLIInterface {
   private cronScheduler: CronScheduler;
   private qqAdapter: QQAdapter | null = null;
   private qqConfigManager: QQConfigManager | null = null;
+  private kukeChatAdapter: KukeChatAdapter | null = null;
+  private autonomousRunner: AutonomousRunner | null = null;
+  private planMode = false;
 
   // Callbacks for external integrations
   onEngineReady?: (engine: CoreEngine) => Promise<void> | void;
   onUserInteraction?: () => void;
+  onShutdownRequested?: () => Promise<void> | void;
 
   constructor(workingDir: string, cronScheduler: CronScheduler) {
     this.workingDir = workingDir;
@@ -88,7 +94,7 @@ export class CLIInterface {
     await this.initialize();
     
     // Print help hint
-    console.log(dim('\n💡 Type "/help" for available commands\n'));
+    console.log(dim('\nTip: /help for commands, /doctor for readiness, /plan on for plan-first work\n'));
 
     // Auto-trigger memory review at startup
     console.log(c('🧠 Reviewing memories at startup...\n', 'brightYellow'));
@@ -163,7 +169,7 @@ export class CLIInterface {
           this.showThinking();
           console.log(dim('\n(Press ESC to interrupt)'));
           
-          const response = await this.engine.processUserInput(trimmed, abortController.signal);
+          const response = await this.engine.processUserInput(this.decorateCliInput(trimmed), abortController.signal);
           this.hideThinking();
 
           if (!abortController.signal.aborted) {
@@ -272,6 +278,7 @@ export class CLIInterface {
     console.log(c('│', 'brightBlue') + `  ${c('✓', 'brightGreen')} ${skills.length.toString().padStart(2)} Skills Loaded          ${c('│', 'brightBlue')}`);
     console.log(c('│', 'brightBlue') + `  ${c('✓', 'brightGreen')} ${servers.length.toString().padStart(2)} MCP Servers Connected  ${c('│', 'brightBlue')}`);
     console.log(c('│', 'brightBlue') + `  ${c('✓', 'brightGreen')} ${tools.length.toString().padStart(2)} Tools Available        ${c('│', 'brightBlue')}`);
+    console.log(c('│', 'brightBlue') + `  ${this.planMode ? c('PLAN', 'brightYellow') : c('CHAT', 'brightGreen')} CLI Mode              ${c('│', 'brightBlue')}`);
     console.log(c('└─────────────────────────────────────────┘', 'brightBlue'));
     console.log();
 
@@ -287,7 +294,7 @@ export class CLIInterface {
       console.log();
     }
 
-    console.log(c('✨ Ready for conversation!\n', 'brightGreen'));
+    console.log(c('Ready for conversation.\n', 'brightGreen'));
   }
 
   /**
@@ -334,11 +341,33 @@ export class CLIInterface {
         break;
       
       case '/mcp':
+      case '/tools':
         this.listMCPTools();
         break;
       
       case '/status':
         await this.printStatus();
+        break;
+
+      case '/runtime':
+        this.showRuntimeStatus();
+        break;
+
+      case '/doctor':
+        await this.runDoctor();
+        break;
+
+      case '/jobs':
+        await this.handleJobsCommand(parts.slice(1));
+        break;
+
+      case '/autonomous':
+      case '/auto':
+        await this.handleAutonomousCommand(parts.slice(1));
+        break;
+
+      case '/plan':
+        this.handlePlanCommand(parts.slice(1));
         break;
       
       case '/clear':
@@ -356,7 +385,7 @@ export class CLIInterface {
         break;
       
       case '/memory':
-        await this.listMemoryFiles();
+        await this.handleMemoryCommand(parts.slice(1));
         break;
       
       case '/reset':
@@ -375,6 +404,11 @@ export class CLIInterface {
         await this.handleQQCommand(parts.slice(1));
         break;
 
+      case '/kukechat':
+      case '/kuke':
+        this.showKukeChatStatus();
+        break;
+
       default:
         this.printError(`Unknown command: ${command}`);
         console.log(dim('Type /help for available commands'));
@@ -383,21 +417,330 @@ export class CLIInterface {
 
   private printHelp(): void {
     console.log();
-    console.log(c('┌─ Available Commands ────────────────────┐', 'brightBlue'));
-    console.log(c('│', 'brightBlue') + '  /help      - Show this help message     ' + c('│', 'brightBlue'));
-    console.log(c('│', 'brightBlue') + '  /skills    - List all available skills  ' + c('│', 'brightBlue'));
-    console.log(c('│', 'brightBlue') + '  /mcp       - List all MCP tools         ' + c('│', 'brightBlue'));
-    console.log(c('│', 'brightBlue') + '  /status    - Show system status         ' + c('│', 'brightBlue'));
-    console.log(c('│', 'brightBlue') + '  /context   - Show context window status ' + c('│', 'brightBlue'));
-    console.log(c('│', 'brightBlue') + '  /compact   - Compact conversation (opt) ' + c('│', 'brightBlue'));
-    console.log(c('│', 'brightBlue') + '  /qq        - QQ NapCat bot management   ' + c('│', 'brightBlue'));
-    console.log(c('│', 'brightBlue') + '  /read      - Read a file                ' + c('│', 'brightBlue'));
-    console.log(c('│', 'brightBlue') + '  /memory    - List memory files          ' + c('│', 'brightBlue'));
-    console.log(c('│', 'brightBlue') + '  /reset     - Reset all AI data (DANGER) ' + c('│', 'brightBlue'));
-    console.log(c('│', 'brightBlue') + '  /clear     - Clear the screen           ' + c('│', 'brightBlue'));
-    console.log(c('│', 'brightBlue') + '  /exit      - Exit the application       ' + c('│', 'brightBlue'));
+    console.log(c('┌─ Commands ──────────────────────────────┐', 'brightBlue'));
+    this.printHelpRow('Core', '/help, /clear, /exit');
+    this.printHelpRow('Inspect', '/status, /runtime, /doctor, /context');
+    this.printHelpRow('Tools', '/tools, /mcp, /skills, /read <file>');
+    this.printHelpRow('Memory', '/memory list|read|search, /compact');
+    this.printHelpRow('Agent', '/auto, /plan on|off|status, /jobs');
+    this.printHelpRow('Chat', '/qq status, /kuke status');
+    this.printHelpRow('Danger', '/reset');
     console.log(c('└─────────────────────────────────────────┘', 'brightBlue'));
+    console.log(dim('Recommended: use /plan on before risky multi-step changes, then /plan off to execute.'));
     console.log();
+  }
+
+  private printHelpRow(label: string, text: string): void {
+    const row = `  ${label.padEnd(7)} ${text}`.slice(0, 39).padEnd(39);
+    console.log(c('│', 'brightBlue') + row + c('│', 'brightBlue'));
+  }
+
+  private decorateCliInput(input: string): string {
+    const marker = this.planMode ? '[CLI Source mode=plan]' : '[CLI Source mode=chat]';
+    if (!this.planMode) return `${marker}\n${input}`;
+
+    return `${marker}\n[Plan Mode Instruction]\nCreate a concise plan, identify risks and files likely to change, and ask for confirmation before modifying files, running destructive commands, or changing persistent configuration. You may inspect files and status to make the plan accurate.\n\n${input}`;
+  }
+
+  private handlePlanCommand(args: string[]): void {
+    const action = (args[0] || 'status').toLowerCase();
+
+    if (action === 'on') {
+      this.planMode = true;
+      console.log(c('Plan Mode enabled. User turns will request a plan before changes.', 'brightYellow'));
+      return;
+    }
+
+    if (action === 'off') {
+      this.planMode = false;
+      console.log(c('Plan Mode disabled. Normal execution mode restored.', 'brightGreen'));
+      return;
+    }
+
+    if (action === 'status') {
+      console.log(this.planMode ? c('Plan Mode: on', 'brightYellow') : c('Plan Mode: off', 'brightGreen'));
+      return;
+    }
+
+    this.printError('Usage: /plan on|off|status');
+  }
+
+  private showRuntimeStatus(): void {
+    if (!this.engine) {
+      this.printError('Engine not initialized');
+      return;
+    }
+
+    const runtime = this.engine.getRuntimeStatus();
+    const cron = this.cronScheduler.getStatus();
+    const qq = this.qqAdapter?.getStatus();
+
+    console.log();
+    console.log(c('┌─ Runtime ───────────────────────────────┐', 'brightCyan'));
+    this.printBoxRow('Model', runtime.model, 'brightCyan');
+    this.printBoxRow('CLI Mode', this.planMode ? 'plan' : 'chat', 'brightCyan');
+    this.printBoxRow('Messages', String(runtime.messages), 'brightCyan');
+    this.printBoxRow('Tools', `${runtime.tools} total, ${runtime.mcpTools} MCP`, 'brightCyan');
+    this.printBoxRow('API', `${runtime.api.active}/${runtime.api.maxConcurrent} active, waiting ${runtime.api.waiting}`, 'brightCyan');
+    this.printBoxRow('Keyed Locks', String(runtime.keyedApiLocks), 'brightCyan');
+    this.printBoxRow('Compaction', runtime.compactionInProgress ? 'running' : 'idle', 'brightCyan');
+    this.printBoxRow('Cron', `${cron.running ? 'running' : 'stopped'}, ${cron.jobs} jobs`, 'brightCyan');
+    this.printBoxRow('QQ', qq ? `${qq.running ? 'running' : 'stopped'}, ${qq.sessions} sessions` : 'not initialized', 'brightCyan');
+    console.log(c('└─────────────────────────────────────────┘', 'brightCyan'));
+    console.log();
+  }
+
+  private async runDoctor(): Promise<void> {
+    const checks: Array<{ label: string; ok: boolean; detail: string }> = [];
+    const memoryPath = path.join(this.workingDir, 'memory');
+    const skillsPath = path.join(this.workingDir, 'skills');
+
+    checks.push({ label: 'AI key', ok: Boolean(process.env.AI_API_KEY), detail: process.env.AI_API_KEY ? 'configured' : 'missing AI_API_KEY' });
+    checks.push({ label: 'AI model', ok: Boolean(process.env.AI_MODEL), detail: process.env.AI_MODEL || 'using client default' });
+    checks.push({ label: 'Engine', ok: Boolean(this.engine), detail: this.engine ? 'ready' : 'not initialized' });
+    checks.push({ label: 'MCP servers', ok: this.mcpManager.getConnectedServers().length > 0, detail: `${this.mcpManager.getConnectedServers().length} connected` });
+    checks.push({ label: 'Tools', ok: this.mcpManager.getAllTools().length > 0, detail: `${this.mcpManager.getAllTools().length} MCP tools` });
+    checks.push({ label: 'Skills', ok: this.skillRegistry.getAllSkills().length > 0, detail: `${this.skillRegistry.getAllSkills().length} loaded` });
+    checks.push({ label: 'Memory dir', ok: await this.pathExists(memoryPath), detail: memoryPath });
+    checks.push({ label: 'Skills dir', ok: await this.pathExists(skillsPath), detail: skillsPath });
+    checks.push({ label: 'Cron', ok: this.cronScheduler.getStatus().running, detail: `${this.cronScheduler.getStatus().jobs} jobs` });
+
+    if (this.qqConfigManager) {
+      const config = this.qqConfigManager.getConfig();
+      const status = this.qqAdapter?.getStatus();
+      checks.push({ label: 'QQ', ok: !config.enabled || Boolean(status?.running), detail: config.enabled ? (status?.running ? 'running' : 'enabled but not running') : 'disabled' });
+    } else {
+      checks.push({ label: 'QQ', ok: true, detail: 'not initialized' });
+    }
+
+    console.log();
+    console.log(c('┌─ Doctor ────────────────────────────────┐', 'brightYellow'));
+    for (const check of checks) {
+      const icon = check.ok ? c('✓', 'brightGreen') : c('!', 'brightRed');
+      this.printBoxRow(`${icon} ${check.label}`, check.detail, 'brightYellow');
+    }
+    console.log(c('└─────────────────────────────────────────┘', 'brightYellow'));
+    console.log();
+  }
+
+  private async handleJobsCommand(args: string[]): Promise<void> {
+    const action = (args[0] || 'list').toLowerCase();
+    const jobId = args[1];
+
+    switch (action) {
+      case 'list':
+      case 'status':
+        this.listCronJobs();
+        return;
+
+      case 'run': {
+        if (!jobId) {
+          this.printError('Usage: /jobs run <id>');
+          return;
+        }
+        const ok = await this.cronScheduler.runJobNow(jobId);
+        console.log(ok ? c(`Job started: ${jobId}`, 'brightGreen') : c(`Job not found or already running: ${jobId}`, 'brightRed'));
+        return;
+      }
+
+      case 'pause':
+      case 'resume': {
+        if (!jobId) {
+          this.printError(`Usage: /jobs ${action} <id>`);
+          return;
+        }
+        const updated = await this.cronScheduler.updateJob(jobId, { enabled: action === 'resume' });
+        console.log(updated ? c(`Job ${action === 'resume' ? 'resumed' : 'paused'}: ${jobId}`, 'brightGreen') : c(`Job not found: ${jobId}`, 'brightRed'));
+        return;
+      }
+
+      case 'remove':
+      case 'delete': {
+        if (!jobId) {
+          this.printError('Usage: /jobs remove <id>');
+          return;
+        }
+        const removed = await this.cronScheduler.removeJob(jobId);
+        console.log(removed ? c(`Job removed: ${jobId}`, 'brightGreen') : c(`Job not found: ${jobId}`, 'brightRed'));
+        return;
+      }
+
+      case 'help':
+        this.printJobsHelp();
+        return;
+
+      default:
+        this.printError(`Unknown /jobs command: ${action}`);
+        this.printJobsHelp();
+    }
+  }
+
+  private listCronJobs(): void {
+    const jobs = this.cronScheduler.getJobs();
+    const executing = new Set(this.cronScheduler.getExecutingJobs());
+
+    console.log();
+    console.log(c('┌─ Scheduled Jobs ────────────────────────┐', 'brightYellow'));
+    if (jobs.length === 0) {
+      this.printBoxRow('Jobs', 'none', 'brightYellow');
+    } else {
+      for (const job of jobs.slice(0, 10)) {
+        const state = executing.has(job.id) ? 'running' : job.enabled ? 'enabled' : 'paused';
+        const next = this.formatNextRun(job.state.nextRunAtMs);
+        this.printBoxRow(job.id, `${state}, ${job.name}, ${next}`, 'brightYellow');
+      }
+      if (jobs.length > 10) this.printBoxRow('More', `${jobs.length - 10} additional jobs`, 'brightYellow');
+    }
+    console.log(c('└─────────────────────────────────────────┘', 'brightYellow'));
+    console.log(dim('Use /jobs run|pause|resume|remove <id>'));
+    console.log();
+  }
+
+  private printJobsHelp(): void {
+    console.log();
+    console.log(c('┌─ Jobs Commands ─────────────────────────┐', 'brightYellow'));
+    this.printBoxRow('/jobs list', 'show scheduled jobs', 'brightYellow');
+    this.printBoxRow('/jobs run <id>', 'trigger a job now', 'brightYellow');
+    this.printBoxRow('/jobs pause <id>', 'disable a job', 'brightYellow');
+    this.printBoxRow('/jobs resume <id>', 'enable a job', 'brightYellow');
+    this.printBoxRow('/jobs remove <id>', 'delete a job', 'brightYellow');
+    console.log(c('└─────────────────────────────────────────┘', 'brightYellow'));
+    console.log();
+  }
+
+  private async handleAutonomousCommand(args: string[]): Promise<void> {
+    if (!this.autonomousRunner) {
+      this.printError('Autonomous runner not initialized');
+      return;
+    }
+
+    const action = (args[0] || 'status').toLowerCase();
+    switch (action) {
+      case 'status':
+        this.showAutonomousStatus();
+        return;
+
+      case 'queue':
+        this.showAutonomousQueue();
+        return;
+
+      case 'log':
+      case 'activity':
+        await this.showAutonomousActivityLog();
+        return;
+
+      case 'cancel': {
+        const id = args[1];
+        if (!id) {
+          this.printError('Usage: /auto cancel <id>');
+          return;
+        }
+        const cancelled = await this.autonomousRunner.cancelWork(id);
+        console.log(cancelled ? c(`Autonomous work cancelled: ${id}`, 'brightGreen') : c(`Work item not cancellable: ${id}`, 'brightRed'));
+        return;
+      }
+
+      case 'help':
+        this.printAutonomousHelp();
+        return;
+
+      default:
+        this.printError(`Unknown /auto command: ${action}`);
+        this.printAutonomousHelp();
+    }
+  }
+
+  private showAutonomousStatus(): void {
+    if (!this.autonomousRunner) return;
+    const status = this.autonomousRunner.getRuntimeStatus();
+    const next = status.nextHeartbeatAt ? new Date(status.nextHeartbeatAt).toLocaleString() : 'not scheduled';
+
+    console.log();
+    console.log(c('┌─ Autonomous ────────────────────────────┐', 'brightMagenta'));
+    this.printBoxRow('Enabled', String(status.enabled), 'brightMagenta');
+    this.printBoxRow('Level', status.autonomyLevel, 'brightMagenta');
+    this.printBoxRow('Interval', `${status.currentIntervalMinutes}m (${status.minIntervalMinutes}-${status.maxIntervalMinutes}m)`, 'brightMagenta');
+    this.printBoxRow('Next', next, 'brightMagenta');
+    this.printBoxRow('Decision', status.lastDecision || 'none', 'brightMagenta');
+    this.printBoxRow('Silent/Error', `${status.consecutiveSilentHeartbeats}/${status.consecutiveErrors}`, 'brightMagenta');
+    this.printBoxRow('Queue', `${status.queue.queued} queued, ${status.queue.due} due, ${status.queue.failed} failed`, 'brightMagenta');
+    this.printBoxRow('Policy', `${status.policy.goals.length} goals, memory>${status.policy.maintenance.memoryReviewMessageThreshold}`, 'brightMagenta');
+    console.log(c('└─────────────────────────────────────────┘', 'brightMagenta'));
+    console.log(dim('Use /auto queue to inspect work items.'));
+    console.log();
+  }
+
+  private showAutonomousQueue(): void {
+    if (!this.autonomousRunner) return;
+    const items = this.autonomousRunner.getQueueItems();
+
+    console.log();
+    console.log(c('┌─ Autonomous Queue ──────────────────────┐', 'brightMagenta'));
+    if (items.length === 0) {
+      this.printBoxRow('Items', 'none', 'brightMagenta');
+    } else {
+      for (const item of items.slice(0, 10)) {
+        const next = item.status === 'queued' ? this.formatNextRun(item.nextRunAtMs) : item.status;
+        this.printBoxRow(item.id, `${item.status}, p${item.priority}, ${next}`, 'brightMagenta');
+        console.log(dim(`  ${item.title.slice(0, 100)}`));
+      }
+      if (items.length > 10) this.printBoxRow('More', `${items.length - 10} additional items`, 'brightMagenta');
+    }
+    console.log(c('└─────────────────────────────────────────┘', 'brightMagenta'));
+    console.log();
+  }
+
+  private printAutonomousHelp(): void {
+    console.log();
+    console.log(c('┌─ Autonomous Commands ───────────────────┐', 'brightMagenta'));
+    this.printBoxRow('/auto status', 'show autonomous runtime', 'brightMagenta');
+    this.printBoxRow('/auto queue', 'show autonomous work queue', 'brightMagenta');
+    this.printBoxRow('/auto log', 'show recent activity log', 'brightMagenta');
+    this.printBoxRow('/auto cancel <id>', 'cancel queued/running work', 'brightMagenta');
+    console.log(c('└─────────────────────────────────────────┘', 'brightMagenta'));
+    console.log();
+  }
+
+  private async showAutonomousActivityLog(): Promise<void> {
+    if (!this.autonomousRunner) return;
+    const entries = await this.autonomousRunner.getActivityLog(12);
+
+    console.log();
+    console.log(c('┌─ Autonomous Activity ───────────────────┐', 'brightMagenta'));
+    if (entries.length === 0) {
+      this.printBoxRow('Entries', 'none', 'brightMagenta');
+    } else {
+      for (const entry of entries) {
+        const time = new Date(entry.timestamp).toLocaleTimeString();
+        this.printBoxRow(time, `${entry.type}: ${entry.message}`, 'brightMagenta');
+      }
+    }
+    console.log(c('└─────────────────────────────────────────┘', 'brightMagenta'));
+    console.log();
+  }
+
+  private formatNextRun(nextRunAtMs?: number): string {
+    if (!nextRunAtMs) return 'no next run';
+    const deltaMs = nextRunAtMs - Date.now();
+    const when = new Date(nextRunAtMs).toLocaleString();
+    if (deltaMs < 0) return `overdue ${Math.round(Math.abs(deltaMs) / 1000)}s, ${when}`;
+    if (deltaMs < 60_000) return `in ${Math.round(deltaMs / 1000)}s, ${when}`;
+    if (deltaMs < 3_600_000) return `in ${Math.round(deltaMs / 60_000)}m, ${when}`;
+    return `in ${Math.round(deltaMs / 3_600_000)}h, ${when}`;
+  }
+
+  private async pathExists(filePath: string): Promise<boolean> {
+    try {
+      await fs.access(filePath);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  private printBoxRow(label: string, value: string, color: keyof typeof colors): void {
+    const plain = `${label}: ${value}`.replace(/\s+/g, ' ');
+    console.log(c('│', color) + `  ${plain.slice(0, 37).padEnd(39)}` + c('│', color));
   }
 
   private listSkills(): void {
@@ -432,6 +775,44 @@ export class CLIInterface {
     console.log();
   }
 
+  private async handleMemoryCommand(args: string[]): Promise<void> {
+    const action = (args[0] || 'list').toLowerCase();
+
+    switch (action) {
+      case 'list':
+        await this.listMemoryFiles();
+        return;
+
+      case 'read': {
+        const target = args.slice(1).join(' ');
+        if (!target) {
+          this.printError('Usage: /memory read <relative-path>');
+          return;
+        }
+        await this.readMemoryFile(target);
+        return;
+      }
+
+      case 'search': {
+        const query = args.slice(1).join(' ').trim();
+        if (!query) {
+          this.printError('Usage: /memory search <query>');
+          return;
+        }
+        await this.searchMemoryFiles(query);
+        return;
+      }
+
+      case 'help':
+        this.printMemoryHelp();
+        return;
+
+      default:
+        this.printError(`Unknown /memory command: ${action}`);
+        this.printMemoryHelp();
+    }
+  }
+
   private async listMemoryFiles(): Promise<void> {
     const memoryPath = path.join(this.workingDir, 'memory');
     
@@ -449,10 +830,110 @@ export class CLIInterface {
       }
       
       console.log(c('└─────────────────────────────────────────┘', 'brightYellow'));
+      console.log(dim('Use /memory read <file> or /memory search <query>'));
       console.log();
     } catch (error) {
       this.printError('Failed to read memory directory');
     }
+  }
+
+  private async readMemoryFile(relativePath: string): Promise<void> {
+    const resolved = this.resolveMemoryPath(relativePath);
+    if (!resolved) {
+      this.printError('Memory path must stay inside memory/');
+      return;
+    }
+
+    try {
+      const stat = await fs.stat(resolved);
+      if (!stat.isFile()) {
+        this.printError('Memory path is not a file');
+        return;
+      }
+
+      const content = await fs.readFile(resolved, 'utf8');
+      console.log();
+      console.log(c('┌─ Memory File ───────────────────────────┐', 'brightYellow'));
+      this.printBoxRow('Path', path.relative(path.join(this.workingDir, 'memory'), resolved), 'brightYellow');
+      console.log(c('└─────────────────────────────────────────┘', 'brightYellow'));
+      console.log(content.slice(0, 12_000));
+      if (content.length > 12_000) console.log(dim('\n[truncated after 12000 characters]'));
+      console.log();
+    } catch (error) {
+      this.printError(error instanceof Error ? error.message : String(error));
+    }
+  }
+
+  private async searchMemoryFiles(query: string): Promise<void> {
+    const memoryPath = path.join(this.workingDir, 'memory');
+    const files = await this.listMarkdownFiles(memoryPath);
+    const normalizedQuery = query.toLowerCase();
+    const matches: Array<{ file: string; line: number; text: string }> = [];
+
+    for (const file of files) {
+      try {
+        const content = await fs.readFile(file, 'utf8');
+        const lines = content.split(/\r?\n/);
+        for (let i = 0; i < lines.length; i++) {
+          if (lines[i].toLowerCase().includes(normalizedQuery)) {
+            matches.push({
+              file: path.relative(memoryPath, file),
+              line: i + 1,
+              text: lines[i].trim(),
+            });
+            if (matches.length >= 20) break;
+          }
+        }
+      } catch {
+        // Ignore unreadable memory files and continue showing useful matches.
+      }
+      if (matches.length >= 20) break;
+    }
+
+    console.log();
+    console.log(c('┌─ Memory Search ─────────────────────────┐', 'brightYellow'));
+    this.printBoxRow('Query', query, 'brightYellow');
+    this.printBoxRow('Matches', String(matches.length), 'brightYellow');
+    console.log(c('└─────────────────────────────────────────┘', 'brightYellow'));
+    for (const match of matches) {
+      console.log(`${c('•', 'brightCyan')} ${match.file}:${match.line} ${dim(match.text.slice(0, 120))}`);
+    }
+    if (matches.length === 0) console.log(dim('No matches.'));
+    if (matches.length >= 20) console.log(dim('Showing first 20 matches.'));
+    console.log();
+  }
+
+  private printMemoryHelp(): void {
+    console.log();
+    console.log(c('┌─ Memory Commands ───────────────────────┐', 'brightYellow'));
+    this.printBoxRow('/memory list', 'show top-level memory files', 'brightYellow');
+    this.printBoxRow('/memory read <file>', 'read a file under memory/', 'brightYellow');
+    this.printBoxRow('/memory search <query>', 'search markdown memories', 'brightYellow');
+    console.log(c('└─────────────────────────────────────────┘', 'brightYellow'));
+    console.log();
+  }
+
+  private resolveMemoryPath(relativePath: string): string | null {
+    const memoryRoot = path.resolve(this.workingDir, 'memory');
+    const resolved = path.resolve(memoryRoot, relativePath);
+    if (resolved !== memoryRoot && !resolved.startsWith(memoryRoot + path.sep)) return null;
+    return resolved;
+  }
+
+  private async listMarkdownFiles(root: string): Promise<string[]> {
+    const result: string[] = [];
+    const entries = await fs.readdir(root, { withFileTypes: true });
+
+    for (const entry of entries) {
+      const fullPath = path.join(root, entry.name);
+      if (entry.isDirectory()) {
+        result.push(...await this.listMarkdownFiles(fullPath));
+      } else if (entry.isFile() && entry.name.endsWith('.md')) {
+        result.push(fullPath);
+      }
+    }
+
+    return result;
   }
 
   private async readFile(filePath: string): Promise<void> {
@@ -640,6 +1121,36 @@ export class CLIInterface {
     this.qqConfigManager = configManager;
   }
 
+  setAutonomousRunner(runner: AutonomousRunner): void {
+    this.autonomousRunner = runner;
+  }
+
+  setKukeChatAdapter(adapter: KukeChatAdapter): void {
+    this.kukeChatAdapter = adapter;
+  }
+
+  private showKukeChatStatus(): void {
+    if (!this.kukeChatAdapter) {
+      this.printError('KukeChat adapter not initialized');
+      return;
+    }
+    const status = this.kukeChatAdapter.getStatus();
+    console.log();
+    console.log(c('┌─ KukeChat Status ───────────────────────┐', 'brightCyan'));
+    this.printBoxRow('Enabled', String(status.enabled), 'brightCyan');
+    this.printBoxRow('Running', String(status.running), 'brightCyan');
+    this.printBoxRow('Connected', String(status.connected), 'brightCyan');
+    this.printBoxRow('Bot User', status.botUserId ? String(status.botUserId) : 'unknown', 'brightCyan');
+    this.printBoxRow('Reconnects', String(status.reconnectAttempts), 'brightCyan');
+    this.printBoxRow('Queue', String(status.queuedMessages), 'brightCyan');
+    console.log(c('└─────────────────────────────────────────┘', 'brightCyan'));
+    console.log();
+  }
+
+  disconnectMCP(): void {
+    this.mcpManager.disconnectAll();
+  }
+
   /**
    * Handle QQ commands
    */
@@ -706,12 +1217,12 @@ export class CLIInterface {
         break;
 
       case 'admin':
-        if (args[2] === 'add' && args[3]) {
-          const userId = parseInt(args[3]);
+        if (args[1] === 'add' && args[2]) {
+          const userId = parseInt(args[2]);
           await this.qqConfigManager.addAdmin(userId);
           console.log(c(`✓ User ${userId} added as admin`, 'brightGreen'));
-        } else if (args[2] === 'remove' && args[3]) {
-          const userId = parseInt(args[3]);
+        } else if (args[1] === 'remove' && args[2]) {
+          const userId = parseInt(args[2]);
           await this.qqConfigManager.removeAdmin(userId);
           console.log(c(`✓ User ${userId} removed from admin`, 'brightGreen'));
         } else {
@@ -802,13 +1313,15 @@ export class CLIInterface {
   private async shutdown(): Promise<void> {
     console.log();
     console.log(dim('Shutting down...'));
+    this.rl?.close();
+
+    if (this.onShutdownRequested) {
+      await this.onShutdownRequested();
+      return;
+    }
 
     this.mcpManager.disconnectAll();
-
     console.log(c('👋 Goodbye!\n', 'brightYellow'));
-
-    this.rl?.close();
-    process.exit(0);
   }
 
   /**

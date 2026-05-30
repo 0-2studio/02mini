@@ -31,6 +31,7 @@ export interface CompactionResult {
   removedIndices: number[];
   summarizedBlocks: SummaryBlock[];
   success: boolean;
+  messages?: ChatMessage[];
 }
 
 /** Summary block for replaced messages */

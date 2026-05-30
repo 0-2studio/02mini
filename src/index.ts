@@ -9,6 +9,7 @@ import { CronScheduler } from './cron/index.js';
 import { GatewayServer } from './gateway/index.js';
 import { AutonomousRunner } from './autonomous/index.js';
 import { QQAdapter, QQConfigManager, createQQTools, executeQQTool } from './qq/index.js';
+import { KukeChatAdapter, KukeChatConfigManager, createKukeChatTool, executeKukeChatTool } from './kukechat/index.js';
 import path from 'path';
 import { fileURLToPath } from 'url';
 
@@ -35,6 +36,12 @@ async function main() {
   const qqConfig = qqConfigManager.getConfig();
   console.log(`[02] QQ adapter: ${qqConfig.enabled ? 'enabled' : 'disabled'}`);
 
+  console.log('[02] Initializing KukeChat config manager...');
+  const kukeChatConfigManager = new KukeChatConfigManager();
+  await kukeChatConfigManager.load();
+  const kukeChatConfig = kukeChatConfigManager.getConfig();
+  console.log(`[02] KukeChat adapter: ${kukeChatConfig.enabled ? 'enabled' : 'disabled'}`);
+
   // Listen for cron events
   cronScheduler.on('job:triggered', (job) => {
     console.log(`[Cron] Job triggered: ${job.name}`);
@@ -55,8 +62,8 @@ async function main() {
   // Start legacy heartbeat scheduler (integrates with Cron)
   const heartbeatPath = path.join(workingDir, 'important', 'heartbeat.md');
   const heartbeatScheduler = new HeartbeatScheduler(heartbeatPath);
-  await heartbeatScheduler.loadTasks();
   heartbeatScheduler.setCronScheduler(cronScheduler);
+  await heartbeatScheduler.loadTasks();
   heartbeatScheduler.start();
 
   // Forward heartbeat events to CLI
@@ -70,17 +77,24 @@ async function main() {
   // Start Gateway (will be initialized after CLI creates engine)
   let gateway: GatewayServer | null = null;
   let autonomous: AutonomousRunner | null = null;
+  let qqAdapter: QQAdapter | null = null;
+  let kukeChatAdapter: KukeChatAdapter | null = null;
 
   // Wait for CLI to initialize and create engine
   cli.onEngineReady = async (engine) => {
     // Start Gateway
     const gatewayPort = parseInt(process.env.GATEWAY_PORT || '3000');
     const gatewayToken = process.env.GATEWAY_TOKEN;
+    const gatewayHost = process.env.GATEWAY_HOST || '127.0.0.1';
+
+    if ((gatewayHost === '0.0.0.0' || gatewayHost === '::') && !gatewayToken) {
+      throw new Error('GATEWAY_TOKEN is required when Gateway is exposed on all interfaces');
+    }
 
     gateway = new GatewayServer(
       {
         port: gatewayPort,
-        host: '0.0.0.0',
+        host: gatewayHost,
         authToken: gatewayToken,
         enableCORS: true,
       },
@@ -94,6 +108,11 @@ async function main() {
     autonomous = new AutonomousRunner(engine, cronScheduler, {
       enabled: process.env.AUTONOMOUS_ENABLED !== 'false',
       intervalMinutes: parseInt(process.env.HEARTBEAT_INTERVAL || '5'),
+      minIntervalMinutes: parseInt(process.env.AUTONOMOUS_MIN_INTERVAL || '1'),
+      maxIntervalMinutes: parseInt(process.env.AUTONOMOUS_MAX_INTERVAL || '30'),
+      autonomyLevel: (process.env.AUTONOMY_LEVEL === 'observe' || process.env.AUTONOMY_LEVEL === 'operate')
+        ? process.env.AUTONOMY_LEVEL
+        : 'assist',
       maxProactivePerHour: parseInt(process.env.MAX_PROACTIVE_PER_HOUR || '10'),
     });
 
@@ -101,9 +120,12 @@ async function main() {
     autonomous.onProactiveMessage((content, trigger) => {
       cli.printProactiveMessage(content, trigger);
     });
+    cli.setAutonomousRunner(autonomous);
+    gateway.setActivityRecorder((_channel: 'gateway', session?: string) => {
+      autonomous?.recordChannelActivity('gateway', session);
+    });
 
     // Start QQ Adapter if enabled
-    let qqAdapter: QQAdapter | null = null;
     if (qqConfigManager.getConfig().enabled) {
       console.log('[02] Starting QQ adapter...');
       qqAdapter = new QQAdapter({
@@ -112,6 +134,9 @@ async function main() {
         configManager: qqConfigManager,
       });
       await qqAdapter.start();
+      qqAdapter.on('activity', (activity: { session?: string }) => {
+        autonomous?.recordChannelActivity('qq', activity.session);
+      });
       
       // Schedule periodic file cleanup (every 24 hours, delete files older than 7 days)
       qqAdapter.scheduleFileCleanup(24);
@@ -122,8 +147,10 @@ async function main() {
       // Register QQ tool with engine
       const qqTool = createQQTools(qqAdapter, qqConfigManager);
       engine.registerTool('qq', qqTool, async (params) => {
-        const result = await executeQQTool(qqAdapter, qqConfigManager, params);
-        return result.message;
+        if (!qqAdapter) {
+          return { success: false, message: 'Error: QQ adapter not initialized' };
+        }
+        return await executeQQTool(qqAdapter, qqConfigManager, params);
       });
       
       // Add QQ context to system prompt if enabled
@@ -133,6 +160,29 @@ async function main() {
         allowedGroups: Array.from(qqConfigManager.getPermissionsSummary().allowedGroups),
         allowedUsers: Array.from(qqConfigManager.getPermissionsSummary().allowedUsers),
       });
+    }
+
+    if (kukeChatConfigManager.getConfig().enabled) {
+      console.log('[02] Starting KukeChat adapter...');
+      kukeChatAdapter = new KukeChatAdapter({
+        engine,
+        configManager: kukeChatConfigManager,
+      });
+      await kukeChatAdapter.start();
+      kukeChatAdapter.on('activity', (activity: { session?: string }) => {
+        autonomous?.recordChannelActivity('gateway', `kukechat:${activity.session || 'unknown'}`);
+      });
+      cli.setKukeChatAdapter(kukeChatAdapter);
+
+      const kukeChatTool = createKukeChatTool();
+      engine.registerTool('kukechat', kukeChatTool, async (params) => {
+        if (!kukeChatAdapter) {
+          return { success: false, message: 'Error: KukeChat adapter not initialized' };
+        }
+        return await executeKukeChatTool(kukeChatAdapter, params);
+      });
+
+      engine.setKukeChatContext({ enabled: true });
     }
 
     // Connect autonomous to Gateway for WebSocket broadcast
@@ -152,8 +202,13 @@ async function main() {
 
     // Record user interactions for silence period
     cli.onUserInteraction = () => {
+      autonomous?.recordChannelActivity('cli');
       autonomous?.recordUserInteraction();
     };
+  };
+
+  cli.onShutdownRequested = async () => {
+    await cleanup('CLI shutdown', 0);
   };
 
   await cli.start();
@@ -183,6 +238,14 @@ async function main() {
         ]).catch(err => console.error('[02] QQ adapter stop failed:', err));
       }
 
+      if (kukeChatAdapter) {
+        console.log('[02] Stopping KukeChat adapter...');
+        await Promise.race([
+          kukeChatAdapter.stop(),
+          new Promise((_, reject) => setTimeout(() => reject(new Error('KukeChat adapter stop timeout')), 5000))
+        ]).catch(err => console.error('[02] KukeChat adapter stop failed:', err));
+      }
+
       if (gateway) {
         console.log('[02] Stopping gateway server...');
         await Promise.race([
@@ -194,6 +257,9 @@ async function main() {
       console.log('[02] Stopping schedulers...');
       cronScheduler.stop();
       heartbeatScheduler.stop();
+
+      console.log('[02] Disconnecting MCP servers...');
+      cli.disconnectMCP();
 
       console.log('[02] Cleanup complete. Goodbye!');
     } catch (error) {

@@ -6,6 +6,7 @@
 
 import { encodingForModel, type TiktokenModel } from 'js-tiktoken';
 import type { ChatMessage } from '../ai/client.js';
+import { contentToText } from './content.js';
 
 // Token budget configuration - reads from environment variables
 function getEnvNumber(key: string, defaultValue: number): number {
@@ -101,7 +102,7 @@ export function countMessageTokens(message: ChatMessage, model: string = 'gpt-4'
   const roleTokens = encoding.encode(message.role).length;
   
   // Count content tokens
-  const contentTokens = encoding.encode(message.content || '').length;
+  const contentTokens = encoding.encode(contentToText(message.content)).length;
   
   // Count tool_calls if present
   let toolTokens = 0;

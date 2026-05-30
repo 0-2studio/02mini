@@ -21,6 +21,11 @@ export interface GatewaySession {
   createdAt: number;
   lastActivity: number;
   messageCount: number;
+  messages: Array<{
+    role: 'user' | 'assistant';
+    content: string;
+    timestamp: number;
+  }>;
 }
 
 /** Chat completion request (OpenAI compatible) */
@@ -78,7 +83,6 @@ export interface ChatCompletionResponse {
 export interface SendMessageRequest {
   message: string;
   sessionId?: string;
-  useHistory?: boolean;
 }
 
 /** Send message response */
@@ -135,4 +139,5 @@ export interface GatewayContext {
   config: GatewayConfig;
   sessions: Map<string, GatewaySession>;
   broadcast: (message: ProactiveMessage) => void;
+  recordActivity?: (channel: 'gateway', session?: string) => void;
 }

@@ -24,7 +24,7 @@ export interface EverySchedule {
 export interface ExpressionSchedule {
   kind: 'cron';
   expr: string; // Cron expression like "0 9 * * *"
-  tz?: string;  // Timezone, default 'Asia/Shanghai'
+  tz?: string;  // Deprecated: scheduling uses host local time
 }
 
 /** Union type for all schedule types */
