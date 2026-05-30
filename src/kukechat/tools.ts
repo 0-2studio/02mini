@@ -47,7 +47,8 @@ Key actions:
 - Media: upload_image, send_image, send_image_url, upload_voice, send_voice
 - Manage: recall_message, update_button, toggle_reaction, delete_reaction
 
-Use KukeChat elements when useful: <quote id="..."/>, <at id="..."/>, <at_all/>, <markdown>...</markdown>, <img src="..."/>, <audio src="..." duration_ms="..."/>, <sticker src="..."/>, <button action="callback" action_id="...">...</button>.`,
+Use KukeChat elements when useful: <quote id="..."/>, <at id="..."/>, <at_all/>, <markdown>...</markdown>, <img src="..."/>, <audio src="..." duration_ms="..."/>, <sticker src="..."/>, <button action="callback" action_id="...">...</button>.
+For quoted replies prefer action=reply_message. Do not include a leading <quote .../> inside markdown/buttons/menu content.`,
       parameters: {
         type: 'object',
         properties: {
@@ -152,9 +153,9 @@ async function execute(adapter: KukeChatAdapter, p: KukeChatParams): Promise<unk
     case 'reply_message': return adapter.sendConversationMessage(requiredNumber(p.conversation_id, 'conversation_id'), `<quote id="${requiredNumber(p.message_id, 'message_id')}"/> ${requiredString(p.message, 'message')}`);
     case 'mention_user': return adapter.sendConversationMessage(requiredNumber(p.conversation_id, 'conversation_id'), `<at id="${requiredNumber(p.user_id, 'user_id')}"/> ${requiredString(p.message, 'message')}`);
     case 'mention_all': return adapter.sendConversationMessage(requiredNumber(p.conversation_id, 'conversation_id'), `<at_all/> ${requiredString(p.message, 'message')}`);
-    case 'send_markdown_message': return adapter.sendConversationMessage(requiredNumber(p.conversation_id, 'conversation_id'), `<markdown>${requiredString(p.markdown ?? p.message, 'markdown')}</markdown>`);
-    case 'send_buttons': return adapter.sendConversationMessage(requiredNumber(p.conversation_id, 'conversation_id'), `<markdown>${requiredString(p.markdown ?? p.message, 'markdown')}\n${renderButtons(p.buttons)}</markdown>`);
-    case 'send_menu': return adapter.sendConversationMessage(requiredNumber(p.conversation_id, 'conversation_id'), `<markdown>## ${escapeElementText(p.label || 'Menu')}\n${requiredString(p.message ?? p.markdown, 'message')}\n${renderButtons(p.buttons)}</markdown>`);
+    case 'send_markdown_message': return adapter.sendConversationMessage(requiredNumber(p.conversation_id, 'conversation_id'), `<markdown>${stripLeadingQuoteElements(requiredString(p.markdown ?? p.message, 'markdown'))}</markdown>`);
+    case 'send_buttons': return adapter.sendConversationMessage(requiredNumber(p.conversation_id, 'conversation_id'), `<markdown>${stripLeadingQuoteElements(requiredString(p.markdown ?? p.message, 'markdown'))}\n${renderButtons(p.buttons)}</markdown>`);
+    case 'send_menu': return adapter.sendConversationMessage(requiredNumber(p.conversation_id, 'conversation_id'), `<markdown>## ${escapeElementText(p.label || 'Menu')}\n${stripLeadingQuoteElements(requiredString(p.message ?? p.markdown, 'message'))}\n${renderButtons(p.buttons)}</markdown>`);
     case 'send_link': return adapter.sendConversationMessage(requiredNumber(p.conversation_id, 'conversation_id'), `<link href="${requiredString(p.link_href, 'link_href')}">${escapeElementText(requiredString(p.link_label, 'link_label'))}</link>`);
     case 'send_sticker': return adapter.sendConversationMessage(requiredNumber(p.conversation_id, 'conversation_id'), `<sticker src="${requiredString(p.sticker_url, 'sticker_url')}"/>`);
     case 'upload_image': return adapter.uploadImage(requiredString(p.file_path, 'file_path'));
@@ -208,4 +209,8 @@ function escapeAttribute(value: string): string {
 
 function escapeElementText(value: string): string {
   return value.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+
+function stripLeadingQuoteElements(value: string): string {
+  return value.replace(/^(?:\s*<quote\s+[^>]*id=["'][^"']+["'][^>]*\/?>\s*)+/i, '').trimStart();
 }

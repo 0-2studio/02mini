@@ -245,7 +245,9 @@ export class KukeChatAdapter extends EventEmitter {
       while (this.queue.length > 0) {
         const item = this.queue.shift()!;
         const message = item.message;
-        const replyHint = this.config.replyToMessages ? `\nReply format hint: use <quote id="${message.id}"/> before your reply when appropriate.` : '';
+        const replyHint = this.config.replyToMessages
+          ? `\nReply format hint: use action=reply_message when you intentionally want to quote message ${message.id}. Do not prepend <quote .../> inside markdown, buttons, menus, images, voice, stickers, or other rich messages.`
+          : '';
         const contentNotes = this.describeMessageElements(message.content);
         const prompt =
           `[KukeChat Source conversation=${message.conversation_id} message=${message.id} sender=${message.sender_id}]\n` +
