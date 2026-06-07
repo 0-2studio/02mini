@@ -278,6 +278,12 @@ export class CoreEngine {
       '   - Or: Ask for clarification if truly impossible',
       '   - NEVER do nothing while pretending to do something',
       '',
+      '5. **FILE OUTPUT LOCATION**',
+      '   - Store all files you create for users or autonomous work under files/',
+      '   - Do not write temporary/generated outputs in the project root',
+      '   - Use descriptive subdirectories such as files/output/, files/reports/, files/images/, or files/tmp/',
+      '   - Runtime state belongs under memory/ only when it is agent memory/state, not user-facing output',
+      '',
       '## Available Skills',
       skillList,
       '',
@@ -289,6 +295,17 @@ export class CoreEngine {
       '',
       '### Built-in Tools',
       '- cron: Manage scheduled jobs and reminders',
+      '- autonomous_control: Inspect and control your autonomous mode (idle/working/paused/audit/blocked)',
+      '',
+      '## Autonomous Self-Control',
+      'You have explicit authority to control your autonomous operating mode using the autonomous_control tool.',
+      'Use autonomous_control instead of directly editing memory/agent-state.json.',
+      '- Use status before making autonomous control decisions when unsure.',
+      '- Use pause when the user asks to pause/stop autonomous behavior or when user work should take priority.',
+      '- Use resume when the user asks to continue/resume autonomous behavior or a blocking reason is resolved.',
+      '- Use audit when you should inspect/report only and avoid modifying state.',
+      '- Use block when you detect unsafe conditions, repeated failures, missing permissions, or possible secret exposure.',
+      '- Use mark_working/mark_idle only to reflect actual autonomous work state; do not fake progress.',
       '',
       '### Skills',
       '- cli-bridge: Send output to user (ALWAYS use this for final response)',
@@ -686,6 +703,46 @@ export class CoreEngine {
               }
             } catch {
               // Default: continue
+              shouldEndConversation = false;
+              shouldAddReminder = true;
+            }
+          }
+
+          if (toolCall.function.name === 'kukechat') {
+            try {
+              const args = JSON.parse(toolCall.function.arguments || '{}');
+              const sendActions = new Set([
+                'send_conversation_message',
+                'send_direct_message',
+                'send_direct_message_body',
+                'reply_message',
+                'mention_user',
+                'mention_all',
+                'send_markdown_message',
+                'send_buttons',
+                'send_menu',
+                'send_link',
+                'send_sticker',
+                'send_image',
+                'send_image_url',
+                'send_voice',
+              ]);
+
+              if (sendActions.has(args.action)) {
+                const isError = result.includes('Error:') || result.includes('failed') || result.includes('not configured');
+                if (isError) {
+                  shouldEndConversation = false;
+                  shouldAddReminder = true;
+                } else if (args.end !== false) {
+                  shouldEndConversation = true;
+                  finalResponse = args.message || '';
+                  console.log('[Engine] kukechat tool called with end=true/omitted, stopping conversation');
+                } else {
+                  shouldEndConversation = false;
+                  shouldAddReminder = true;
+                }
+              }
+            } catch {
               shouldEndConversation = false;
               shouldAddReminder = true;
             }

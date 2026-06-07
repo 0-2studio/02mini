@@ -13,7 +13,11 @@
     "smoke:kukechat": "bun scripts/kukechat-smoke.ts",
     "memory:health": "bun scripts/memory-health.ts",
     "memory:health:json": "bun scripts/memory-health.ts --json",
-    "memory:health:test": "bun scripts/memory-health.test.ts"
+    "memory:health:critical": "bun scripts/memory-health.ts --fail-on-critical",
+    "memory:health:test": "bun scripts/memory-health.test.ts",
+    "autonomous:control:test": "bun scripts/autonomous-control.test.ts",
+    "kukechat:interaction:test": "bun scripts/kukechat-interaction-state.test.ts",
+    "kukechat:interaction-store:test": "bun scripts/kukechat-interaction-state-store.test.ts"
   },
   "keywords": ["ai", "mcp", "self-aware", "agent"],
   "author": "",

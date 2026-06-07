@@ -20,6 +20,8 @@ import {
 import { AutonomousQueueStoreManager } from './queue.js';
 import { AutonomousActivityLog } from './activity-log.js';
 import { AutonomousPolicyStore, type AutonomousPolicy } from './policy.js';
+import { AutonomousStateStore, type AutonomousControlState, type AutonomousControlMode } from './state.js';
+import { AutonomousCheckpointStore, type CheckpointEvent } from './checkpoint.js';
 
 export class AutonomousRunner extends EventEmitter {
   private config: AutonomousConfig;
@@ -34,6 +36,8 @@ export class AutonomousRunner extends EventEmitter {
   private workQueue: AutonomousQueueStoreManager;
   private activityLog: AutonomousActivityLog;
   private policyStore: AutonomousPolicyStore;
+  private controlState: AutonomousStateStore;
+  private checkpointStore: AutonomousCheckpointStore;
   private policy?: AutonomousPolicy;
   private initialized = false;
 
@@ -51,6 +55,8 @@ export class AutonomousRunner extends EventEmitter {
     this.workQueue = new AutonomousQueueStoreManager(workingDir);
     this.activityLog = new AutonomousActivityLog(workingDir);
     this.policyStore = new AutonomousPolicyStore(workingDir);
+    this.controlState = new AutonomousStateStore(workingDir);
+    this.checkpointStore = new AutonomousCheckpointStore(workingDir);
 
     this.state = {
       enabled: this.config.enabled,
@@ -145,6 +151,10 @@ export class AutonomousRunner extends EventEmitter {
   recordUserInteraction(): void {
     this.lastUserInteraction = Date.now();
     this.recordChannelActivity('cli');
+    const control = this.controlState.get();
+    if (control.mode === 'working') {
+      void this.controlState.setMode('paused', 'Paused because a user interaction arrived during autonomous work', 'user-interaction', control.activeWorkId);
+    }
   }
 
   recordChannelActivity(channel: 'cli' | 'gateway' | 'qq' | 'cron' | 'autonomous', session?: string): void {
@@ -190,6 +200,16 @@ export class AutonomousRunner extends EventEmitter {
     try {
       await this.ensureInitialized();
 
+      const control = this.controlState.get();
+      if (control.mode === 'paused' || control.mode === 'blocked') {
+        const reason = `Autonomous ${control.mode}: ${control.reason || 'no reason'}`;
+        this.state.lastSkipReason = reason;
+        this.adjustCadence('skip');
+        await this.logActivity('skip', `Skipped heartbeat because state is ${control.mode}`, { reason: control.reason });
+        await this.writeCheckpoint('skipped', { result: 'heartbeat skipped', nextStep: 'resume or unblock autonomous mode', blockedReason: reason });
+        return { executed: false, reason, timestamp: now };
+      }
+
       // Check if within active hours
       if (!this.isWithinActiveHours()) {
         this.state.lastSkipReason = 'Outside active hours';
@@ -232,7 +252,9 @@ export class AutonomousRunner extends EventEmitter {
         interval: this.state.currentIntervalMinutes,
       });
 
-      await this.seedAutonomousWorkFromState();
+      if (!this.controlState.isAuditOnly()) {
+        await this.seedAutonomousWorkFromState();
+      }
       const queueResult = await this.processDueWorkItem();
       if (queueResult) {
         this.state.lastHeartbeatAt = now;
@@ -260,11 +282,29 @@ export class AutonomousRunner extends EventEmitter {
         };
       }
 
+      if (this.controlState.isAuditOnly()) {
+        this.state.lastSkipReason = 'Audit mode: proactive heartbeat work skipped';
+        this.adjustCadence('skip');
+        await this.logActivity('skip', 'Skipped proactive heartbeat in audit mode');
+        await this.writeCheckpoint('skipped', { result: 'audit mode skip', nextStep: 'resume autonomous mode to allow work' });
+        return { executed: false, reason: 'Audit mode', timestamp: now };
+      }
+
       // Build heartbeat prompt
       const prompt = this.buildHeartbeatPrompt();
 
+      if (!this.controlState.canStartWork()) {
+        const current = this.controlState.get();
+        const reason = `Autonomous mode ${current.mode} prevents proactive work`;
+        await this.logActivity('skip', reason, { mode: current.mode, reason: current.reason });
+        await this.writeCheckpoint('skipped', { result: 'proactive heartbeat skipped', nextStep: 'wait for idle/resume', blockedReason: reason });
+        return { executed: false, reason, timestamp: now };
+      }
+
       // Call engine
+      await this.controlState.markWorking('heartbeat', 'Scheduled heartbeat proactive check');
       const response = await this.engine.processProactive(prompt);
+      await this.controlState.markIdle('Heartbeat proactive check completed');
 
       this.state.lastHeartbeatAt = now;
 
@@ -316,6 +356,8 @@ export class AutonomousRunner extends EventEmitter {
       this.state.lastSkipReason = error instanceof Error ? error.message : String(error);
       this.adjustCadence('error');
       await this.logActivity('queue-failed', 'Heartbeat failed', { error: this.state.lastSkipReason });
+      await this.controlState.setMode('blocked', this.state.lastSkipReason || 'Heartbeat failed', 'autonomous');
+      await this.writeCheckpoint('failed', { result: 'heartbeat failed', blockedReason: this.state.lastSkipReason });
       return {
         executed: false,
         reason: error instanceof Error ? error.message : String(error),
@@ -337,7 +379,22 @@ export class AutonomousRunner extends EventEmitter {
 
         try {
           await this.logActivity('cron-agent-turn', `Cron agent turn started: ${job.name}`, { jobId: job.id });
+          const control = this.controlState.get();
+          if (control.mode === 'paused' || control.mode === 'blocked' || control.mode === 'audit') {
+            await this.logActivity('skip', `Skipped cron agent turn because state is ${control.mode}`, { jobId: job.id, reason: control.reason });
+            await this.writeCheckpoint('skipped', {
+              activeWorkId: job.id,
+              title: job.name,
+              source: 'cron',
+              result: 'cron agent turn skipped',
+              nextStep: 'resume autonomous mode to allow cron agent turns',
+              blockedReason: `${control.mode}: ${control.reason || 'no reason'}`,
+            });
+            return;
+          }
+          await this.controlState.markWorking(job.id, `Cron agent turn: ${job.name}`, 'cron');
           const response = await this.engine.handleAgentTurn(job);
+          await this.controlState.markIdle(`Cron agent turn completed: ${job.name}`, 'cron');
 
         const trigger: ProactiveTrigger = {
           type: 'cron',
@@ -349,11 +406,26 @@ export class AutonomousRunner extends EventEmitter {
           this.recordChannelActivity('cron', job.id);
           await this.emitProactive(response, trigger);
           await this.logActivity('cron-agent-turn', `Cron agent turn completed: ${job.name}`, { jobId: job.id });
+          await this.writeCheckpoint('completed', {
+            activeWorkId: job.id,
+            title: job.name,
+            source: 'cron',
+            result: response,
+            nextStep: 'none',
+          });
         } catch (error) {
           console.error('[Autonomous] Cron agent turn error:', error);
           await this.logActivity('queue-failed', `Cron agent turn failed: ${job.name}`, {
             jobId: job.id,
             error: error instanceof Error ? error.message : String(error),
+          });
+          await this.controlState.setMode('blocked', error instanceof Error ? error.message : String(error), 'cron');
+          await this.writeCheckpoint('failed', {
+            activeWorkId: job.id,
+            title: job.name,
+            source: 'cron',
+            result: 'cron agent turn failed',
+            blockedReason: error instanceof Error ? error.message : String(error),
           });
         }
       });
@@ -459,7 +531,36 @@ export class AutonomousRunner extends EventEmitter {
       lastUserInteraction: this.lastUserInteraction,
       queue: this.workQueue.getSummary(),
       policy: this.policy || this.policyStore.get(),
+      control: this.controlState.get(),
+      checkpointPath: this.checkpointStore.getCurrentPath(),
     };
+  }
+
+  async setControlMode(mode: AutonomousControlMode, reason: string = '', updatedBy: string = 'user', activeWorkId?: string): Promise<AutonomousControlState> {
+    await this.ensureInitialized();
+    const state = await this.controlState.setMode(mode, reason, updatedBy, activeWorkId);
+    await this.writeCheckpoint('skipped', {
+      result: `mode changed to ${mode}`,
+      nextStep: mode === 'idle' ? 'autonomous work may resume' : 'autonomous work will not advance',
+      blockedReason: reason,
+    });
+    return state;
+  }
+
+  async pause(reason: string = 'Paused by user', updatedBy: string = 'user'): Promise<AutonomousControlState> {
+    return this.setControlMode('paused', reason, updatedBy);
+  }
+
+  async resume(reason: string = 'Resumed by user', updatedBy: string = 'user'): Promise<AutonomousControlState> {
+    return this.setControlMode('idle', reason, updatedBy);
+  }
+
+  async audit(reason: string = 'Audit mode by user', updatedBy: string = 'user'): Promise<AutonomousControlState> {
+    return this.setControlMode('audit', reason, updatedBy);
+  }
+
+  async block(reason: string = 'Blocked by user', updatedBy: string = 'user'): Promise<AutonomousControlState> {
+    return this.setControlMode('blocked', reason, updatedBy);
   }
 
   private lastProactiveFingerprint?: string;
@@ -529,6 +630,8 @@ export class AutonomousRunner extends EventEmitter {
     await this.workQueue.init();
     await this.activityLog.init();
     await this.policyStore.init();
+    await this.controlState.init();
+    await this.checkpointStore.init();
     this.policy = this.policyStore.get();
     this.initialized = true;
   }
@@ -594,15 +697,45 @@ export class AutonomousRunner extends EventEmitter {
 
   private async processDueWorkItem(): Promise<{ response: string; reason: string } | null> {
     if (this.config.autonomyLevel === 'observe') return null;
+    const control = this.controlState.get();
+    if (control.mode === 'paused' || control.mode === 'blocked' || control.mode === 'audit') {
+      await this.logActivity('skip', `Skipped work queue because state is ${control.mode}`, { reason: control.reason });
+      await this.writeCheckpoint('skipped', { result: 'work queue skipped', nextStep: 'resume autonomous mode', blockedReason: `${control.mode}: ${control.reason || 'no reason'}` });
+      return null;
+    }
+    if (!this.controlState.canStartWork()) return null;
     const due = this.workQueue.getDue(1);
     const next = due[0];
     if (!next) return null;
 
     const running = await this.workQueue.markRunning(next.id);
     if (!running) return null;
+    await this.controlState.markWorking(running.id, `Autonomous work started: ${running.title}`);
     await this.logActivity('queue-started', `Started autonomous work: ${running.title}`, { itemId: running.id }, running.id);
+    await this.writeCheckpoint('started', {
+      activeWorkId: running.id,
+      title: running.title,
+      source: running.source,
+      prompt: running.prompt,
+      result: 'started',
+      nextStep: 'execute work item',
+    });
 
     try {
+      const beforeCall = this.controlState.get();
+      if (beforeCall.mode !== 'working' || beforeCall.activeWorkId !== running.id) {
+        await this.logActivity('skip', `Work item interrupted before execution: ${running.title}`, { itemId: running.id, mode: beforeCall.mode }, running.id);
+        await this.writeCheckpoint('skipped', {
+          activeWorkId: running.id,
+          title: running.title,
+          source: running.source,
+          prompt: running.prompt,
+          result: 'interrupted before execution',
+          nextStep: 'resume if work should continue',
+          blockedReason: beforeCall.reason,
+        });
+        return null;
+      }
       const response = await this.engine.processProactive(
         `[Autonomous Work Queue Source id=${running.id} source=${running.source} priority=${running.priority}]\n` +
         `Title: ${running.title}\n` +
@@ -613,12 +746,31 @@ export class AutonomousRunner extends EventEmitter {
 
       await this.workQueue.markDone(running.id, response);
       await this.logActivity('queue-completed', `Completed autonomous work: ${running.title}`, { itemId: running.id }, running.id);
+      await this.controlState.markIdle(`Autonomous work completed: ${running.title}`);
+      await this.writeCheckpoint('completed', {
+        activeWorkId: running.id,
+        title: running.title,
+        source: running.source,
+        prompt: running.prompt,
+        result: response,
+        nextStep: 'none',
+      });
       if (!this.isSubstantiveResponse(response)) return null;
       return { response, reason: `Autonomous work completed: ${running.title}` };
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       await this.workQueue.markFailed(running.id, message);
       await this.logActivity('queue-failed', `Failed autonomous work: ${running.title}`, { error: message }, running.id);
+      await this.controlState.setMode('blocked', message, 'autonomous', running.id);
+      await this.writeCheckpoint('failed', {
+        activeWorkId: running.id,
+        title: running.title,
+        source: running.source,
+        prompt: running.prompt,
+        result: 'failed',
+        nextStep: 'user review required',
+        blockedReason: message,
+      });
       throw error;
     }
   }
@@ -633,6 +785,41 @@ export class AutonomousRunner extends EventEmitter {
       await this.activityLog.append({ type, message, metadata, itemId });
     } catch (error) {
       console.warn('[Autonomous] Failed to write activity log:', error);
+    }
+  }
+
+  private async writeCheckpoint(
+    event: CheckpointEvent,
+    input: {
+      activeWorkId?: string;
+      title?: string;
+      source?: string;
+      prompt?: string;
+      filesChanged?: string[] | 'unknown';
+      validation?: string;
+      result?: string;
+      nextStep?: string;
+      blockedReason?: string;
+    } = {},
+  ): Promise<void> {
+    try {
+      const current = this.controlState.get();
+      const checkpointPath = await this.checkpointStore.write({
+        event,
+        mode: current.mode,
+        activeWorkId: input.activeWorkId || current.activeWorkId,
+        title: input.title,
+        source: input.source,
+        prompt: input.prompt,
+        filesChanged: input.filesChanged || 'unknown',
+        validation: input.validation || 'unknown',
+        result: input.result,
+        nextStep: input.nextStep,
+        blockedReason: input.blockedReason,
+      });
+      await this.controlState.setLastCheckpointPath(checkpointPath);
+    } catch (error) {
+      console.warn('[Autonomous] Failed to write checkpoint:', error);
     }
   }
 

@@ -157,6 +157,12 @@ export class CLIInterface {
         return;
       }
 
+      if (await this.handleAutonomousControlPhrase(trimmed)) {
+        this.onUserInteraction?.();
+        this.rl?.prompt();
+        return;
+      }
+
       // Process regular input
       if (this.engine) {
         // Record user interaction
@@ -620,6 +626,22 @@ export class CLIInterface {
         this.showAutonomousStatus();
         return;
 
+      case 'pause':
+      case 'resume':
+      case 'audit':
+      case 'block': {
+        const reason = args.slice(1).join(' ') || `${action} requested from CLI`;
+        const state = action === 'pause'
+          ? await this.autonomousRunner.pause(reason)
+          : action === 'resume'
+            ? await this.autonomousRunner.resume(reason)
+            : action === 'audit'
+              ? await this.autonomousRunner.audit(reason)
+              : await this.autonomousRunner.block(reason);
+        console.log(c(`Autonomous mode: ${state.mode} (${state.reason || 'no reason'})`, action === 'resume' ? 'brightGreen' : 'brightYellow'));
+        return;
+      }
+
       case 'queue':
         this.showAutonomousQueue();
         return;
@@ -654,10 +676,14 @@ export class CLIInterface {
     if (!this.autonomousRunner) return;
     const status = this.autonomousRunner.getRuntimeStatus();
     const next = status.nextHeartbeatAt ? new Date(status.nextHeartbeatAt).toLocaleString() : 'not scheduled';
+    const control = status.control;
 
     console.log();
     console.log(c('┌─ Autonomous ────────────────────────────┐', 'brightMagenta'));
     this.printBoxRow('Enabled', String(status.enabled), 'brightMagenta');
+    this.printBoxRow('Mode', `${control.mode}${control.reason ? `, ${control.reason}` : ''}`, 'brightMagenta');
+    this.printBoxRow('ActiveWork', control.activeWorkId || 'none', 'brightMagenta');
+    this.printBoxRow('Checkpoint', control.lastCheckpointPath || status.checkpointPath || 'none', 'brightMagenta');
     this.printBoxRow('Level', status.autonomyLevel, 'brightMagenta');
     this.printBoxRow('Interval', `${status.currentIntervalMinutes}m (${status.minIntervalMinutes}-${status.maxIntervalMinutes}m)`, 'brightMagenta');
     this.printBoxRow('Next', next, 'brightMagenta');
@@ -694,6 +720,10 @@ export class CLIInterface {
     console.log();
     console.log(c('┌─ Autonomous Commands ───────────────────┐', 'brightMagenta'));
     this.printBoxRow('/auto status', 'show autonomous runtime', 'brightMagenta');
+    this.printBoxRow('/auto pause [why]', 'pause autonomous work', 'brightMagenta');
+    this.printBoxRow('/auto resume [why]', 'resume autonomous work', 'brightMagenta');
+    this.printBoxRow('/auto audit [why]', 'audit/read-only mode', 'brightMagenta');
+    this.printBoxRow('/auto block [why]', 'block until user review', 'brightMagenta');
     this.printBoxRow('/auto queue', 'show autonomous work queue', 'brightMagenta');
     this.printBoxRow('/auto log', 'show recent activity log', 'brightMagenta');
     this.printBoxRow('/auto cancel <id>', 'cancel queued/running work', 'brightMagenta');
@@ -717,6 +747,32 @@ export class CLIInterface {
     }
     console.log(c('└─────────────────────────────────────────┘', 'brightMagenta'));
     console.log();
+  }
+
+  private async handleAutonomousControlPhrase(input: string): Promise<boolean> {
+    if (!this.autonomousRunner) return false;
+    const normalized = input.trim();
+    const reason = `Phrase command: ${normalized.slice(0, 120)}`;
+
+    if (/^(暂停自主|停止自主)$/.test(normalized)) {
+      const state = await this.autonomousRunner.pause(reason);
+      console.log(c(`Autonomous paused: ${state.reason}`, 'brightYellow'));
+      return true;
+    }
+
+    if (/^进入审计$/.test(normalized)) {
+      const state = await this.autonomousRunner.audit(reason);
+      console.log(c(`Autonomous audit mode: ${state.reason}`, 'brightYellow'));
+      return true;
+    }
+
+    if (/^(恢复自主|继续自主)$/.test(normalized)) {
+      const state = await this.autonomousRunner.resume(reason);
+      console.log(c(`Autonomous resumed: ${state.reason}`, 'brightGreen'));
+      return true;
+    }
+
+    return false;
   }
 
   private formatNextRun(nextRunAtMs?: number): string {

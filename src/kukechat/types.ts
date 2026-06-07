@@ -10,6 +10,8 @@ export interface KukeChatConfig {
   splitLongMessages: boolean;
   replyToMessages: boolean;
   ignoreBotMessages: boolean;
+  accumulationDelay: number;
+  maxQueueSize: number;
 }
 
 export interface KukeChatUser {
@@ -76,4 +78,6 @@ export const DEFAULT_KUKECHAT_CONFIG: KukeChatConfig = {
   splitLongMessages: true,
   replyToMessages: true,
   ignoreBotMessages: true,
+  accumulationDelay: 1000,
+  maxQueueSize: 200,
 };

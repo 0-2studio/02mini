@@ -7,7 +7,7 @@ import { CLIInterface } from './cli/interface.js';
 import { HeartbeatScheduler } from './heartbeat/scheduler.js';
 import { CronScheduler } from './cron/index.js';
 import { GatewayServer } from './gateway/index.js';
-import { AutonomousRunner } from './autonomous/index.js';
+import { AutonomousRunner, createAutonomousControlTool, executeAutonomousControlTool } from './autonomous/index.js';
 import { QQAdapter, QQConfigManager, createQQTools, executeQQTool } from './qq/index.js';
 import { KukeChatAdapter, KukeChatConfigManager, createKukeChatTool, executeKukeChatTool } from './kukechat/index.js';
 import path from 'path';
@@ -123,6 +123,14 @@ async function main() {
     cli.setAutonomousRunner(autonomous);
     gateway.setActivityRecorder((_channel: 'gateway', session?: string) => {
       autonomous?.recordChannelActivity('gateway', session);
+    });
+
+    const autonomousControlTool = createAutonomousControlTool();
+    engine.registerTool('autonomous_control', autonomousControlTool, async (params) => {
+      if (!autonomous) {
+        return { success: false, message: 'Error: Autonomous runner not initialized' };
+      }
+      return await executeAutonomousControlTool(autonomous, params);
     });
 
     // Start QQ Adapter if enabled

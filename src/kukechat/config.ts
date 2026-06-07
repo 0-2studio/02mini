@@ -43,5 +43,13 @@ export class KukeChatConfigManager {
     if (env.KUKECHAT_IGNORE_BOT_MESSAGES !== undefined) {
       this.config.ignoreBotMessages = env.KUKECHAT_IGNORE_BOT_MESSAGES === 'true';
     }
+    if (env.KUKECHAT_ACCUMULATION_DELAY) {
+      const parsed = parseInt(env.KUKECHAT_ACCUMULATION_DELAY, 10);
+      if (Number.isInteger(parsed) && parsed >= 0 && parsed <= 60_000) this.config.accumulationDelay = parsed;
+    }
+    if (env.KUKECHAT_MAX_QUEUE_SIZE) {
+      const parsed = parseInt(env.KUKECHAT_MAX_QUEUE_SIZE, 10);
+      if (Number.isInteger(parsed) && parsed > 0) this.config.maxQueueSize = parsed;
+    }
   }
 }

@@ -17,6 +17,24 @@ interface QueueItem {
   timestamp: number;
 }
 
+interface ConversationBatch {
+  conversationId: number;
+  messages: QueueItem[];
+}
+
+interface CachedKukeChatMessage {
+  id: number;
+  conversation_id: number;
+  sender_id?: number;
+  sender_display_name?: string;
+  sender?: KukeChatMessageCreatedData['sender'];
+  type?: string;
+  content: string;
+  metadata?: Record<string, any>;
+  created_at: string;
+  direction: 'incoming' | 'outgoing';
+}
+
 export class KukeChatAdapter extends EventEmitter {
   private readonly engine: CoreEngine;
   private readonly configManager: KukeChatConfigManager;
@@ -30,7 +48,11 @@ export class KukeChatAdapter extends EventEmitter {
   private botUserId?: number;
   private queue: QueueItem[] = [];
   private seenMessageIds: Map<number, number> = new Map();
-  private lastMessageIdByConversation: Map<number, number> = new Map();
+  private latestReceivedMessageIdByConversation: Map<number, number> = new Map();
+  private lastProcessedMessageIdByConversation: Map<number, number> = new Map();
+  private recentMessagesByConversation: Map<number, CachedKukeChatMessage[]> = new Map();
+  private syntheticOutgoingMessageId = -1;
+  private readonly maxCachedMessagesPerConversation = 200;
 
   constructor(options: { engine: CoreEngine; configManager: KukeChatConfigManager }) {
     super();
@@ -83,7 +105,9 @@ export class KukeChatAdapter extends EventEmitter {
   async sendConversationMessage(conversationId: number, message: string): Promise<string> {
     const sent: unknown[] = [];
     for (const part of this.splitMessage(message)) {
-      sent.push(await this.requestJson('POST', `/bot-api/conversations/${conversationId}/messages`, { message: part }));
+      const result = await this.requestJson('POST', `/bot-api/conversations/${conversationId}/messages`, { message: part });
+      sent.push(result);
+      this.cacheOutgoingMessage(conversationId, part, result);
     }
     return `KukeChat message sent to conversation ${conversationId} (${sent.length} part(s))`;
   }
@@ -125,7 +149,18 @@ export class KukeChatAdapter extends EventEmitter {
     search.set('limit', String(Math.max(1, Math.min(100, params.limit ?? 50))));
     if (params.before_id) search.set('before_id', String(params.before_id));
     if (params.after_id) search.set('after_id', String(params.after_id));
-    return this.requestJson('GET', `/bot-api/conversations/${conversationId}/messages?${search.toString()}`);
+    const remote = await this.requestJson('GET', `/bot-api/conversations/${conversationId}/messages?${search.toString()}`);
+    const remoteMessages = this.extractMessageArray(remote);
+    if (remoteMessages.length > 0) {
+      for (const message of remoteMessages) this.cacheMessageLike(conversationId, message, 'incoming');
+      return remote;
+    }
+
+    return {
+      source: 'local-cache',
+      note: 'Remote KukeChat history query returned no messages; returning messages observed by this running bot process.',
+      messages: this.getCachedMessages(conversationId, params),
+    };
   }
 
   async sendDirectMessageBody(userId: number, message: string): Promise<string> {
@@ -161,7 +196,22 @@ export class KukeChatAdapter extends EventEmitter {
   }
 
   getLastMessageId(conversationId: number): number | undefined {
-    return this.lastMessageIdByConversation.get(conversationId);
+    return this.lastProcessedMessageIdByConversation.get(conversationId);
+  }
+
+  getLatestReceivedMessageId(conversationId: number): number | undefined {
+    return this.latestReceivedMessageIdByConversation.get(conversationId);
+  }
+
+  getCachedMessages(conversationId: number, params: { limit?: number; before_id?: number; after_id?: number } = {}): CachedKukeChatMessage[] {
+    const limit = Math.max(1, Math.min(100, params.limit ?? 50));
+    let messages = [...(this.recentMessagesByConversation.get(conversationId) || [])]
+      .sort((a, b) => a.id - b.id);
+
+    if (params.before_id !== undefined) messages = messages.filter(message => message.id < params.before_id!);
+    if (params.after_id !== undefined) messages = messages.filter(message => message.id > params.after_id!);
+
+    return messages.slice(-limit);
   }
 
   private async connect(): Promise<void> {
@@ -230,8 +280,13 @@ export class KukeChatAdapter extends EventEmitter {
     if (this.config.ignoreBotMessages && (message.sender?.is_bot || message.sender_id === this.botUserId)) return;
     if (!message.content?.trim()) return;
     if (this.isDuplicateMessage(message.id)) return;
-    this.rememberMessageId(message.conversation_id, message.id);
+    this.rememberReceivedMessageId(message.conversation_id, message.id);
+    this.cacheIncomingMessage(message);
 
+    if (this.queue.length >= this.config.maxQueueSize) {
+      const dropped = this.queue.shift();
+      console.warn(`[KukeChat] Message queue full, dropped oldest message ${dropped?.message.id || 'unknown'}`);
+    }
     this.queue.push({ message, timestamp: Date.now() });
     this.emit('activity', { channel: 'kukechat', session: `conversation:${message.conversation_id}` });
     void this.processQueue();
@@ -243,29 +298,70 @@ export class KukeChatAdapter extends EventEmitter {
 
     try {
       while (this.queue.length > 0) {
-        const item = this.queue.shift()!;
-        const message = item.message;
-        const replyHint = this.config.replyToMessages
-          ? `\nReply format hint: use action=reply_message when you intentionally want to quote message ${message.id}. Do not prepend <quote .../> inside markdown, buttons, menus, images, voice, stickers, or other rich messages.`
-          : '';
-        const contentNotes = this.describeMessageElements(message.content);
-        const prompt =
-          `[KukeChat Source conversation=${message.conversation_id} message=${message.id} sender=${message.sender_id}]\n` +
-          `Sender: ${message.sender_display_name || message.sender?.nickname || message.sender?.username || message.sender_id}\n` +
-          `Created: ${message.created_at}\n` +
-          `Content: ${message.content}\n` +
-          `${contentNotes}${replyHint}`;
+        const batchItems = this.queue.splice(0, this.queue.length);
+        const batches = this.groupQueueByConversation(batchItems);
 
-        const rawResponse = await this.engine.processUserInput(prompt);
-        const response = stripMessageMarker(rawResponse).trim();
-        if (response && response !== 'NO' && !response.includes('[Conversation ended by stop tool]')) {
-          // If the model did not use the tool, do not auto-send. Tool-based sending keeps intent explicit.
-          console.log('[KukeChat] Engine returned non-tool response; not auto-sending.');
+        for (const batch of batches) {
+          const prompt = this.buildBatchPrompt(batch);
+          const rawResponse = await this.engine.processUserInput(prompt);
+          this.markBatchProcessed(batch);
+          const response = stripMessageMarker(rawResponse).trim();
+          if (response && response !== 'NO' && !response.includes('[Conversation ended by stop tool]')) {
+            // If the model did not use the tool, do not auto-send. Tool-based sending keeps intent explicit.
+            console.log('[KukeChat] Engine returned non-tool response; not auto-sending.');
+          }
         }
       }
     } finally {
       this.processing = false;
     }
+  }
+
+  private groupQueueByConversation(items: QueueItem[]): ConversationBatch[] {
+    const groups = new Map<number, ConversationBatch>();
+    for (const item of items) {
+      const conversationId = item.message.conversation_id;
+      if (!groups.has(conversationId)) groups.set(conversationId, { conversationId, messages: [] });
+      groups.get(conversationId)!.messages.push(item);
+    }
+    return [...groups.values()].sort((a, b) => a.messages[0].timestamp - b.messages[0].timestamp);
+  }
+
+  private buildBatchPrompt(batch: ConversationBatch): string {
+    const latest = batch.messages.at(-1)?.message;
+    let prompt = `[KukeChat Source conversation=${batch.conversationId} messages=${batch.messages.map(item => item.message.id).join(',')}]\n`;
+    prompt += `[KukeChat Messages - Conversation]\n\n`;
+    prompt += `Conversation ID: ${batch.conversationId}\n`;
+    prompt += `Latest message ID: ${latest?.id ?? 'unknown'}\n`;
+    prompt += `Messages:\n`;
+
+    for (const item of batch.messages) {
+      const message = item.message;
+      const senderName = message.sender_display_name || message.sender?.nickname || message.sender?.username || 'Unknown';
+      prompt += `[${new Date(message.created_at).toLocaleTimeString()}] ${senderName} (ID: ${message.sender_id}, message=${message.id}): ${message.content}\n`;
+      const contentNotes = this.describeMessageElements(message.content);
+      if (contentNotes) {
+        prompt += contentNotes.split('\n').filter(Boolean).map(line => `  ${line}`).join('\n') + '\n';
+      }
+    }
+
+    prompt += `\n## Instructions\n`;
+    prompt += `You are processing KukeChat messages. Use the kukechat tool to send replies.\n`;
+    prompt += `Answer messages directed at you and avoid duplicate replies. If no reply is needed, reply "NO" as plain assistant text; never send "NO" through the kukechat tool.\n`;
+    prompt += `For quoted replies, use action=reply_message with the target message_id. Do not prepend <quote .../> inside markdown/buttons/menu/image/voice/sticker content.\n`;
+    prompt += `For normal replies, use action=send_conversation_message with conversation_id=${batch.conversationId}.\n`;
+    prompt += `For markdown/buttons/menu, use the matching kukechat action and keep content concise.\n`;
+    prompt += `When done after sending, use end=true.\n`;
+
+    return prompt;
+  }
+
+  private markBatchProcessed(batch: ConversationBatch): void {
+    let maxId = 0;
+    for (const item of batch.messages) {
+      if (item.message.id > maxId) maxId = item.message.id;
+    }
+    if (maxId > 0) this.rememberProcessedMessageId(batch.conversationId, maxId);
   }
 
   private isDuplicateMessage(messageId: number): boolean {
@@ -281,7 +377,7 @@ export class KukeChatAdapter extends EventEmitter {
     return false;
   }
 
-  private async requestJson(method: string, path: string, body?: unknown): Promise<unknown> {
+  protected async requestJson(method: string, path: string, body?: unknown): Promise<unknown> {
     if (!this.config.botKey) throw new Error('KukeChat bot key is not configured');
     const response = await fetch(`${this.config.baseUrl}${path}`, {
       method,
@@ -357,9 +453,108 @@ export class KukeChatAdapter extends EventEmitter {
     return mimeType;
   }
 
-  private rememberMessageId(conversationId: number, messageId: number): void {
-    const current = this.lastMessageIdByConversation.get(conversationId) || 0;
-    if (messageId > current) this.lastMessageIdByConversation.set(conversationId, messageId);
+  private rememberReceivedMessageId(conversationId: number, messageId: number): void {
+    const current = this.latestReceivedMessageIdByConversation.get(conversationId) || 0;
+    if (messageId > current) this.latestReceivedMessageIdByConversation.set(conversationId, messageId);
+  }
+
+  private rememberProcessedMessageId(conversationId: number, messageId: number): void {
+    const current = this.lastProcessedMessageIdByConversation.get(conversationId) || 0;
+    if (messageId > current) this.lastProcessedMessageIdByConversation.set(conversationId, messageId);
+  }
+
+  private cacheIncomingMessage(message: KukeChatMessageCreatedData): void {
+    this.cacheMessage({
+      id: message.id,
+      conversation_id: message.conversation_id,
+      sender_id: message.sender_id,
+      sender_display_name: message.sender_display_name,
+      sender: message.sender,
+      type: message.type,
+      content: message.content,
+      metadata: message.metadata,
+      created_at: message.created_at,
+      direction: 'incoming',
+    });
+  }
+
+  private cacheOutgoingMessage(conversationId: number, content: string, response: unknown): void {
+    const message = this.extractMessageObject(response);
+    this.cacheMessage({
+      id: this.extractNumericId(message) ?? this.syntheticOutgoingMessageId--,
+      conversation_id: conversationId,
+      sender_id: this.botUserId,
+      content: this.extractStringField(message, 'content') ?? this.extractStringField(message, 'message') ?? content,
+      metadata: this.extractObjectField(message, 'metadata'),
+      created_at: this.extractStringField(message, 'created_at') ?? new Date().toISOString(),
+      direction: 'outgoing',
+    });
+  }
+
+  private cacheMessageLike(conversationId: number, input: unknown, fallbackDirection: 'incoming' | 'outgoing'): void {
+    const message = this.extractMessageObject(input);
+    const id = this.extractNumericId(message);
+    const content = this.extractStringField(message, 'content') ?? this.extractStringField(message, 'message');
+    if (!id || !content) return;
+
+    this.cacheMessage({
+      id,
+      conversation_id: this.extractNumberField(message, 'conversation_id') ?? conversationId,
+      sender_id: this.extractNumberField(message, 'sender_id'),
+      sender_display_name: this.extractStringField(message, 'sender_display_name'),
+      content,
+      metadata: this.extractObjectField(message, 'metadata'),
+      created_at: this.extractStringField(message, 'created_at') ?? new Date().toISOString(),
+      direction: fallbackDirection,
+    });
+  }
+
+  private cacheMessage(message: CachedKukeChatMessage): void {
+    const messages = this.recentMessagesByConversation.get(message.conversation_id) || [];
+    const existingIndex = messages.findIndex(existing => existing.id === message.id);
+    if (existingIndex >= 0) messages[existingIndex] = message;
+    else messages.push(message);
+
+    messages.sort((a, b) => a.id - b.id);
+    while (messages.length > this.maxCachedMessagesPerConversation) messages.shift();
+    this.recentMessagesByConversation.set(message.conversation_id, messages);
+  }
+
+  private extractMessageArray(input: unknown): unknown[] {
+    if (Array.isArray(input)) return input;
+    if (!input || typeof input !== 'object') return [];
+    const record = input as Record<string, unknown>;
+    for (const key of ['messages', 'data', 'items', 'results']) {
+      if (Array.isArray(record[key])) return record[key];
+    }
+    return [];
+  }
+
+  private extractMessageObject(input: unknown): Record<string, unknown> | undefined {
+    if (!input || typeof input !== 'object') return undefined;
+    const record = input as Record<string, unknown>;
+    if (record.message && typeof record.message === 'object') return record.message as Record<string, unknown>;
+    if (record.data && typeof record.data === 'object' && !Array.isArray(record.data)) return record.data as Record<string, unknown>;
+    return record;
+  }
+
+  private extractNumericId(record: Record<string, unknown> | undefined): number | undefined {
+    return this.extractNumberField(record, 'id') ?? this.extractNumberField(record, 'message_id');
+  }
+
+  private extractNumberField(record: Record<string, unknown> | undefined, key: string): number | undefined {
+    const value = record?.[key];
+    return typeof value === 'number' && Number.isFinite(value) ? value : undefined;
+  }
+
+  private extractStringField(record: Record<string, unknown> | undefined, key: string): string | undefined {
+    const value = record?.[key];
+    return typeof value === 'string' ? value : undefined;
+  }
+
+  private extractObjectField(record: Record<string, unknown> | undefined, key: string): Record<string, any> | undefined {
+    const value = record?.[key];
+    return value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, any> : undefined;
   }
 
   private describeMessageElements(content: string): string {
@@ -391,5 +586,9 @@ export class KukeChatAdapter extends EventEmitter {
       parts.push(message.slice(i, i + max));
     }
     return parts;
+  }
+
+  private sleep(ms: number): Promise<void> {
+    return new Promise(resolve => setTimeout(resolve, ms));
   }
 }

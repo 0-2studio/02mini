@@ -123,6 +123,9 @@ interface KukeChatParams {
 
 export async function executeKukeChatTool(adapter: KukeChatAdapter, params: KukeChatParams): Promise<KukeChatToolResult> {
   try {
+    if (isNoReply(params)) {
+      return { success: true, message: '[No reply sent - AI chose not to respond]' };
+    }
     const result = await execute(adapter, params);
     return { success: true, message: typeof result === 'string' ? result : JSON.stringify(result) };
   } catch (error) {
@@ -144,7 +147,14 @@ async function execute(adapter: KukeChatAdapter, p: KukeChatParams): Promise<unk
     case 'catch_up_messages': {
       const conversationId = requiredNumber(p.conversation_id, 'conversation_id');
       const afterId = p.after_id ?? adapter.getLastMessageId(conversationId);
-      if (!afterId) throw new Error('after_id is required when no last message id is known');
+      if (!afterId) {
+        return {
+          source: 'local-cache',
+          note: 'No processed message id is known yet; returning recent messages observed by this running bot process.',
+          latest_received_message_id: adapter.getLatestReceivedMessageId(conversationId),
+          messages: adapter.getCachedMessages(conversationId, { limit: p.limit }),
+        };
+      }
       return adapter.getMessages(conversationId, { after_id: afterId, limit: p.limit });
     }
     case 'send_conversation_message': return adapter.sendConversationMessage(requiredNumber(p.conversation_id, 'conversation_id'), requiredString(p.message, 'message'));
@@ -187,6 +197,23 @@ function requiredString(value: string | undefined, name: string): string {
 function requiredNumber(value: number | undefined, name: string): number {
   if (!Number.isFinite(value)) throw new Error(`${name} is required`);
   return value as number;
+}
+
+function isNoReply(p: KukeChatParams): boolean {
+  const sendActions = new Set([
+    'send_conversation_message',
+    'send_direct_message',
+    'send_direct_message_body',
+    'reply_message',
+    'mention_user',
+    'mention_all',
+    'send_markdown_message',
+    'send_buttons',
+    'send_menu',
+  ]);
+  if (!sendActions.has(p.action)) return false;
+  const text = (p.message ?? p.markdown ?? '').trim();
+  return text === 'NO';
 }
 
 function renderButtons(buttons?: KukeChatParams['buttons']): string {

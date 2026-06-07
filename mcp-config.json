@@ -5,10 +5,11 @@
       "args": ["-y", "@modelcontextprotocol/server-filesystem@latest", "."]
     },
     "fetch": {
-      "command": "npx",
-      "args": ["-y", "mcp-fetch-server@1.1.2"],
+      "command": "bun",
+      "args": ["src/mcp-servers/fetch.ts"],
       "env": {
-        "DEFAULT_LIMIT": "50000"
+        "DEFAULT_LIMIT": "50000",
+        "FETCH_PROXY": "http://127.0.0.1:7897"
       }
     },
     "mcp-server-code-runner": {
